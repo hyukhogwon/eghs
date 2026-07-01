@@ -1,0 +1,16 @@
+{
+  "name": "eghs",
+  "version": "1.0.0",
+  "description": "Evidence-Gated Hook System for Claude Code",
+  "main": "index.js",
+  "scripts": {
+    "test": "node --test tests/"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "picomatch": "^4.0.4"
+  }
+}
