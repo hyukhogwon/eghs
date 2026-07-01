@@ -42,7 +42,12 @@ function emit(exitCode, decision, extra) {
       extra: extra || {},
     })
   );
-  process.exit(exitCode);
+  // Not process.exit(): on a pipe (the normal hook-invocation channel),
+  // Node does not guarantee a stdout write completes before exit() returns,
+  // which could truncate the decision JSON. Setting exitCode and returning
+  // lets the event loop drain (flushing stdout) before the process exits
+  // naturally — main() has no other open handles by this point.
+  process.exitCode = exitCode;
 }
 
 async function main() {
@@ -115,11 +120,28 @@ async function main() {
     return;
   }
 
-  const config = loadConfig(repoRoot);
+  let config;
+  try {
+    config = loadConfig(repoRoot);
+  } catch (err) {
+    emit(2, { decision: 'block', deny_code: 'INFRA_NOT_READY', reason: err.message });
+    return;
+  }
+
+  // Lock staleness budget must cover the worst-case verification runtime,
+  // not a single command's timeout — sequential mode can legitimately run
+  // N commands back-to-back (PRD §R5: "60s 목표는 보장하지 않음" for
+  // verification_parallel:false). Undercounting here would let a second
+  // invocation reclaim a lock still held by a genuinely-running verification.
+  const commandCount = Object.values(config.verification_commands).filter(Boolean).length;
+  const lockTimeoutMs = config.verification_parallel
+    ? config.verification_timeout_seconds * 1000
+    : config.verification_timeout_seconds * 1000 * Math.max(commandCount, 1);
+
   const lockResult = acquireStopLock(stateDir, sid, {
     pid,
     uid,
-    timeoutMs: config.verification_timeout_seconds * 1000,
+    timeoutMs: lockTimeoutMs,
     nowMs,
   });
   if (!lockResult.ok) {
@@ -131,13 +153,18 @@ async function main() {
     return;
   }
 
-  // `emit()` calls process.exit(), which would skip a pending `finally` —
-  // so build the outcome inside try/finally and only emit (and exit) after
-  // the lock has actually been released.
+  // `emit()` used to call process.exit(), which would skip a pending
+  // `finally` — build the outcome inside try/finally and only emit after
+  // the lock has actually been released. Every branch below ASSIGNS
+  // `outcome` and falls through to the end of the try block rather than
+  // `return`ing early — an early `return` here previously skipped the
+  // single `emit()` call after the `finally`, silently exiting 0 instead
+  // of reporting the intended block decision.
   let outcome;
   try {
     const diffBase = config.diff_base === 'session_baseline' ? baseline.commit : config.diff_base;
-    let result;
+    let result = null;
+    let verifyError = null;
     try {
       result = await runVerification(config, {
         repoRoot,
@@ -147,6 +174,10 @@ async function main() {
         env: process.env,
       });
     } catch (err) {
+      verifyError = err;
+    }
+
+    if (verifyError) {
       appendDebugLog(stateDir, sid, {
         ts_ms: nowMs,
         hook: 'Stop',
@@ -155,35 +186,34 @@ async function main() {
       });
       outcome = {
         exitCode: 2,
-        decision: { decision: 'block', deny_code: 'INFRA_NOT_READY', reason: err.message },
+        decision: { decision: 'block', deny_code: 'INFRA_NOT_READY', reason: verifyError.message },
         extra: {},
       };
-      return;
-    }
-
-    appendDebugLog(stateDir, sid, {
-      ts_ms: nowMs,
-      hook: 'Stop',
-      decision: result.passed ? 'allow' : 'block',
-      deny_code: result.passed ? null : 'VERIFICATION_FAILED',
-    });
-
-    if (result.passed) {
-      outcome = {
-        exitCode: 0,
-        decision: { decision: 'allow', reason: result.skipped ? 'skipped (docs-only change)' : null },
-        extra: { failedChecks: [] },
-      };
     } else {
-      outcome = {
-        exitCode: 2,
-        decision: {
-          decision: 'block',
-          deny_code: 'VERIFICATION_FAILED',
-          reason: `verification failed: ${result.failedChecks.join(', ')}`,
-        },
-        extra: { results: result.results.map((r) => ({ name: r.name, exitCode: r.exitCode, timedOut: r.timedOut })) },
-      };
+      appendDebugLog(stateDir, sid, {
+        ts_ms: nowMs,
+        hook: 'Stop',
+        decision: result.passed ? 'allow' : 'block',
+        deny_code: result.passed ? null : 'VERIFICATION_FAILED',
+      });
+
+      outcome = result.passed
+        ? {
+            exitCode: 0,
+            decision: { decision: 'allow', reason: result.skipped ? 'skipped (docs-only change)' : null },
+            extra: { failedChecks: [] },
+          }
+        : {
+            exitCode: 2,
+            decision: {
+              decision: 'block',
+              deny_code: 'VERIFICATION_FAILED',
+              reason: `verification failed: ${result.failedChecks.join(', ')}`,
+            },
+            extra: {
+              results: result.results.map((r) => ({ name: r.name, exitCode: r.exitCode, timedOut: r.timedOut })),
+            },
+          };
     }
   } finally {
     lockResult.release();

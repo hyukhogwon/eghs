@@ -101,6 +101,56 @@ test('runVerification forces STOP_HOOK_ACTIVE=1 for child processes regardless o
   assert.match(log, /^1/m);
 });
 
+test('runVerification warns on stderr when verification_env tries to override STOP_HOOK_ACTIVE', async () => {
+  const repoRoot = mkGitRepo();
+  const stateDir = path.join(repoRoot, '.claude', 'state', 'eghs');
+  const originalWrite = process.stderr.write;
+  let captured = '';
+  process.stderr.write = function (chunk, ...args) {
+    captured += chunk;
+    return originalWrite.call(process.stderr, chunk, ...args);
+  };
+  try {
+    await runVerification(
+      baseConfig({
+        verification_commands: { typecheck: 'true' },
+        verification_env: { STOP_HOOK_ACTIVE: '0' },
+      }),
+      { repoRoot, sid: 'sid-1', stateDir, diffBase: 'HEAD', env: process.env }
+    );
+  } finally {
+    process.stderr.write = originalWrite;
+  }
+  assert.match(captured, /STOP_HOOK_ACTIVE/);
+});
+
+test('runVerification treats a spawn failure (bad verification_shell) as a failed check, not a crash', async () => {
+  const repoRoot = mkGitRepo();
+  const stateDir = path.join(repoRoot, '.claude', 'state', 'eghs');
+  const result = await runVerification(
+    baseConfig({
+      verification_commands: { typecheck: 'true' },
+      verification_shell: ['/no/such/shell/binary'],
+    }),
+    { repoRoot, sid: 'sid-1', stateDir, diffBase: 'HEAD', env: process.env }
+  );
+  assert.equal(result.passed, false);
+  assert.deepEqual(result.failedChecks, ['typecheck']);
+});
+
+test('runVerification falls back to process cwd when verification_cwd does not exist on disk', async () => {
+  const repoRoot = mkGitRepo();
+  const stateDir = path.join(repoRoot, '.claude', 'state', 'eghs');
+  const result = await runVerification(
+    baseConfig({
+      verification_commands: { typecheck: 'true' },
+      verification_cwd: path.join(repoRoot, 'does-not-exist'),
+    }),
+    { repoRoot, sid: 'sid-1', stateDir, diffBase: 'HEAD', env: process.env }
+  );
+  assert.equal(result.passed, true);
+});
+
 test('runVerification marks a timed-out command as failed', async () => {
   const repoRoot = mkGitRepo();
   const stateDir = path.join(repoRoot, '.claude', 'state', 'eghs');

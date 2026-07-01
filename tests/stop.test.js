@@ -188,3 +188,53 @@ test('skip_if_only_changed skips verification entirely for a docs-only change', 
   assert.equal(exitCode, 0);
   assert.equal(decision.decision, 'allow');
 });
+
+test('a bad diff_base produces a real block decision on stdout, not a silent exit 0', () => {
+  const repo = mkRepo();
+  execFileSync('node', [INIT_SCRIPT], { cwd: repo });
+  writeConfig(repo, {
+    verification_commands: { typecheck: 'true' },
+    diff_base: 'nonexistent-ref-xyz',
+  });
+  const { exitCode, decision } = runStop(repo, { session_id: SID_1 });
+  assert.equal(exitCode, 2);
+  assert.equal(decision.decision, 'block');
+  assert.equal(decision.deny_code, 'INFRA_NOT_READY');
+});
+
+test('a spawn failure (bad verification_shell) blocks with a classified deny_code instead of crashing', () => {
+  const repo = mkRepo();
+  execFileSync('node', [INIT_SCRIPT], { cwd: repo });
+  writeConfig(repo, {
+    verification_commands: { typecheck: 'true' },
+    verification_shell: ['/no/such/shell/binary'],
+  });
+  const { exitCode, decision } = runStop(repo, { session_id: SID_1 });
+  assert.equal(exitCode, 2);
+  assert.equal(decision.decision, 'block');
+  assert.equal(decision.deny_code, 'VERIFICATION_FAILED');
+});
+
+test('malformed eghs.config.json blocks with INFRA_NOT_READY instead of crashing with exit 1', () => {
+  const repo = mkRepo();
+  execFileSync('node', [INIT_SCRIPT], { cwd: repo });
+  fs.mkdirSync(path.join(repo, '.claude'), { recursive: true });
+  fs.writeFileSync(path.join(repo, '.claude', 'eghs.config.json'), '{ not json');
+  const { exitCode, decision } = runStop(repo, { session_id: SID_1 });
+  assert.equal(exitCode, 2);
+  assert.equal(decision.decision, 'block');
+  assert.equal(decision.deny_code, 'INFRA_NOT_READY');
+});
+
+test('the recursion lock is released after a bad-diff_base block (a following run is not lock-contended)', () => {
+  const repo = mkRepo();
+  execFileSync('node', [INIT_SCRIPT], { cwd: repo });
+  writeConfig(repo, {
+    verification_commands: { typecheck: 'true' },
+    diff_base: 'nonexistent-ref-xyz',
+  });
+  const first = runStop(repo, { session_id: SID_1 });
+  assert.equal(first.decision.deny_code, 'INFRA_NOT_READY');
+  const stateDir = path.join(repo, '.claude', 'state', 'eghs');
+  assert.ok(!fs.existsSync(path.join(stateDir, 'locks', `stop-${SID_1}.lock`)));
+});
