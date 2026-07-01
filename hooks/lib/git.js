@@ -22,15 +22,29 @@ function getHeadCommit(repoRoot) {
   }
 }
 
+// Deliberately does NOT swallow every `git diff` failure to []: a bad
+// diffBase (e.g. a shallow clone missing the baseline commit) must not be
+// silently mistaken for "no changes" — that would make skip_if_only_changed
+// fail open. Only "not a git repository at all" degrades softly, matching
+// PRD §R5 "git이 없으면... 항상 verification 실행" (never skip on missing git).
+// git's own error text for a missing repo differs by subcommand (`git diff`
+// says "Could not access 'HEAD'", `git rev-parse` says "not a git
+// repository"), so this checks repo-ness explicitly via getRepoRoot instead
+// of pattern-matching stderr.
 function getChangedFiles(repoRoot, diffBase) {
-  let tracked = [];
-  let untracked = [];
+  if (getRepoRoot(repoRoot) === null) {
+    return [];
+  }
+
+  let tracked;
   try {
     const out = git(['diff', '--name-only', diffBase, '--', '.'], repoRoot);
     tracked = out ? out.split('\n').filter(Boolean) : [];
-  } catch {
-    tracked = [];
+  } catch (err) {
+    throw new Error(`[eghs] git diff --name-only ${diffBase} failed: ${err.message}`);
   }
+
+  let untracked = [];
   try {
     const out = git(['ls-files', '--others', '--exclude-standard'], repoRoot);
     untracked = out ? out.split('\n').filter(Boolean) : [];

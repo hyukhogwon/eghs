@@ -44,3 +44,16 @@ test('inactive when eghs-off is a directory, not a regular file', () => {
     reason: null,
   });
 });
+
+test('inactive (not a crash) when eghs-off is a broken symlink', () => {
+  const repo = mkTmpRepo();
+  fs.mkdirSync(path.join(repo, '.claude'), { recursive: true });
+  fs.symlinkSync(
+    path.join(repo, '.claude', 'does-not-exist'),
+    path.join(repo, '.claude', 'eghs-off')
+  );
+  assert.deepEqual(checkKillSwitch({ repoRoot: repo, env: {} }), {
+    active: false,
+    reason: null,
+  });
+});

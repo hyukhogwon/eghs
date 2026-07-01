@@ -1,39 +1,28 @@
 'use strict';
 const fs = require('fs');
 const path = require('path');
-
-let seqCounter = 0;
-function nextSeq() {
-  seqCounter += 1;
-  return seqCounter;
-}
+const { writeTmpFile, fsyncDir } = require('./tmp-file');
 
 // destination-local temp + fsync(fd) + rename(2) + fsync(dirfd) — PRD §R2.5
 function atomicWriteFile(destPath, contents) {
-  const destDir = path.dirname(destPath);
-  const tmpDir = path.join(destDir, 'tmp');
-  fs.mkdirSync(tmpDir, { recursive: true, mode: 0o700 });
-  const tmpPath = path.join(
-    tmpDir,
-    `${path.basename(destPath)}.${process.pid}.${nextSeq()}`
-  );
+  const tmpPath = writeTmpFile(destPath, contents);
 
-  const fd = fs.openSync(tmpPath, 'w', 0o600);
   try {
-    fs.writeSync(fd, contents);
-    fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
+    fs.renameSync(tmpPath, destPath);
+  } catch (err) {
+    if (err.code === 'EISDIR') {
+      // destPath exists as the wrong type (e.g. a corrupted schema_version
+      // that got replaced by a stray directory). Clearing it lets this
+      // self-heal instead of crashing the exact `eghs-init --repair` path
+      // that's meant to recover from an INVALID schema_version.
+      fs.rmSync(destPath, { recursive: true, force: true });
+      fs.renameSync(tmpPath, destPath);
+    } else {
+      throw err;
+    }
   }
 
-  fs.renameSync(tmpPath, destPath);
-
-  const dirFd = fs.openSync(destDir, 'r');
-  try {
-    fs.fsyncSync(dirFd);
-  } finally {
-    fs.closeSync(dirFd);
-  }
+  fsyncDir(path.dirname(destPath));
 }
 
 module.exports = { atomicWriteFile };

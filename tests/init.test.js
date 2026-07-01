@@ -47,3 +47,26 @@ test('eghs-init --repair recreates a manually deleted subdir', () => {
   run(['--repair'], repo);
   assert.ok(fs.statSync(locksDir).isDirectory());
 });
+
+test('eghs-init does not leak .init.lock after a successful run', () => {
+  const repo = mkTmpRepo();
+  run([], repo);
+  assert.ok(!fs.existsSync(path.join(repo, '.claude', 'state', 'eghs', '.init.lock')));
+});
+
+test('eghs-init does not leak .init.lock when it refuses to run twice', () => {
+  const repo = mkTmpRepo();
+  run([], repo);
+  assert.throws(() => run([], repo));
+  assert.ok(!fs.existsSync(path.join(repo, '.claude', 'state', 'eghs', '.init.lock')));
+});
+
+test('eghs-init refuses to run while another .init.lock is held (concurrent bootstrap)', () => {
+  const repo = mkTmpRepo();
+  const stateDir = path.join(repo, '.claude', 'state', 'eghs');
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, '.init.lock'), '');
+  assert.throws(() => run([], repo));
+  // schema_version must not have been written while the lock was held.
+  assert.ok(!fs.existsSync(path.join(stateDir, 'schema_version')));
+});

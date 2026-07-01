@@ -56,6 +56,16 @@ test('getChangedFiles includes modified tracked files and untracked files', () =
   assert.deepEqual(changed, ['a.ts', 'new.ts']);
 });
 
+test('getChangedFiles throws (does not silently report []) when diffBase is an invalid revision inside a real repo', () => {
+  const dir = mkGitRepo();
+  assert.throws(() => getChangedFiles(dir, 'nonexistent-ref-xyz'), /git diff/);
+});
+
+test('getChangedFiles degrades to [] (does not throw) when repoRoot is not a git repository at all', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'eghs-notrepo-'));
+  assert.deepEqual(getChangedFiles(dir, 'HEAD'), []);
+});
+
 test('shouldSkipVerification is true when every changed file matches a skip glob', () => {
   assert.equal(
     shouldSkipVerification(['README.md', 'docs/x.md'], ['**/*.md', 'docs/**']),

@@ -37,3 +37,9 @@ test('loadConfig throws a descriptive error on invalid JSON', () => {
   fs.writeFileSync(path.join(repo, '.claude', 'eghs.config.json'), '{ not json');
   assert.throws(() => loadConfig(repo), /eghs\.config\.json/);
 });
+
+test('loadConfig throws a descriptive error (not a raw EISDIR) when the config path is a directory', () => {
+  const repo = mkTmpRepo();
+  fs.mkdirSync(path.join(repo, '.claude', 'eghs.config.json'), { recursive: true });
+  assert.throws(() => loadConfig(repo), /eghs\.config\.json/);
+});

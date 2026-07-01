@@ -41,3 +41,11 @@ test('atomicWriteFile uses a fresh tmp filename per call (monotonic seq)', () =>
   assert.equal(fs.readFileSync(path.join(dir, 'a.json'), 'utf8'), '{}');
   assert.equal(fs.readFileSync(path.join(dir, 'b.json'), 'utf8'), '{}');
 });
+
+test('atomicWriteFile self-heals when the destination is a stray directory (EISDIR)', () => {
+  const dir = mkTmpDir();
+  const dest = path.join(dir, 'schema_version');
+  fs.mkdirSync(dest); // simulates a corrupted state dir entry
+  atomicWriteFile(dest, '1\n');
+  assert.equal(fs.readFileSync(dest, 'utf8'), '1\n');
+});

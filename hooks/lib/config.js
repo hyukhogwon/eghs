@@ -15,17 +15,27 @@ const DEFAULT_CONFIG = Object.freeze({
   debug: true,
 });
 
+// Shallow top-level merge of .claude/eghs.config.json onto DEFAULT_CONFIG —
+// a user-set key fully replaces its default (no per-key deep merge). All of
+// DEFAULT_CONFIG's object-valued defaults are currently empty, so this is
+// only observable when a user sets a key at all.
 function loadConfig(repoRoot) {
   const configPath = path.join(repoRoot, '.claude', 'eghs.config.json');
-  let userConfig = {};
-  if (fs.existsSync(configPath)) {
-    const raw = fs.readFileSync(configPath, 'utf8');
-    try {
-      userConfig = JSON.parse(raw);
-    } catch (err) {
-      throw new Error(`[eghs] failed to parse .claude/eghs.config.json: ${err.message}`);
-    }
+  let raw;
+  try {
+    raw = fs.readFileSync(configPath, 'utf8');
+  } catch (err) {
+    if (err.code === 'ENOENT') return { ...DEFAULT_CONFIG };
+    throw new Error(`[eghs] failed to read .claude/eghs.config.json: ${err.message}`);
   }
+
+  let userConfig;
+  try {
+    userConfig = JSON.parse(raw);
+  } catch (err) {
+    throw new Error(`[eghs] failed to parse .claude/eghs.config.json: ${err.message}`);
+  }
+
   return { ...DEFAULT_CONFIG, ...userConfig };
 }
 

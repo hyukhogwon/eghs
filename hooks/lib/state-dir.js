@@ -8,11 +8,10 @@ function resolveStateDir(repoRoot) {
 }
 
 // Subdirs Stop hook needs in P1. reads/, failed/, pre/ are P3 scope.
+const DIRS_WITH_TMP = ['locks', 'sessions', 'baselines'];
 const P1_SUBDIRS = [
   'tmp',
-  'locks', path.join('locks', 'tmp'),
-  'sessions', path.join('sessions', 'tmp'),
-  'baselines', path.join('baselines', 'tmp'),
+  ...DIRS_WITH_TMP.flatMap((d) => [d, path.join(d, 'tmp')]),
   'verify-logs',
   'debug',
 ];
