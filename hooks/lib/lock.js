@@ -2,15 +2,9 @@
 const fs = require('fs');
 const path = require('path');
 const { exclusiveLinkCreate } = require('./exclusive-link');
+const { isAlive } = require('./proc');
 
-function isAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return err.code !== 'ESRCH'; // EPERM etc. => treat as alive (fail-closed)
-  }
-}
+const NOOP_RELEASE = () => {};
 
 function readLockBody(lockPath) {
   try {
@@ -20,34 +14,62 @@ function readLockBody(lockPath) {
   }
 }
 
+function sameEntry(a, b) {
+  return !!a && !!b && a.pid === b.pid && a.start_ms === b.start_ms;
+}
+
+function isStale(body, uid, nowMs, graceMs) {
+  return (
+    !!body &&
+    body.uid === uid &&
+    !isAlive(body.pid) &&
+    nowMs > body.start_ms + body.timeout_ms + graceMs
+  );
+}
+
 // PRD §R2.5 "Exclusive lock 획득 절차" + stale recovery, scoped to what P1's
 // single-writer (Stop hook) needs. The full recover-lock TOCTOU dance from
 // the spec is collapsed here because only one process type ever contends
-// for this lock in P1 (no PreToolUse/PostToolUse hooks exist yet).
+// for this lock in P1 (no PreToolUse/PostToolUse hooks exist yet) — but a
+// second concurrent Stop invocation for the same sid is still possible, so
+// reclaim always re-verifies immediately before its destructive unlink
+// rather than deleting whatever it read moments earlier.
 function acquireStopLock(stateDir, sid, { pid, uid, timeoutMs, nowMs, graceMs = 5000 }) {
   const lockPath = path.join(stateDir, 'locks', `stop-${sid}.lock`);
-  const body = JSON.stringify({ pid, uid, start_ms: nowMs, timeout_ms: timeoutMs });
+  return claimLock(lockPath, null, { pid, uid, timeoutMs, nowMs, graceMs }, 5);
+}
 
-  let result = exclusiveLinkCreate(lockPath, body);
-  if (result.ok) return { ok: true, release: () => releaseOwn(lockPath, pid, nowMs) };
+function claimLock(lockPath, expectedStale, opts, attemptsLeft) {
+  const { pid, uid, timeoutMs, nowMs, graceMs } = opts;
 
-  // EEXIST: check staleness once, reclaim if safe, retry exactly once.
-  const existing = readLockBody(lockPath);
-  if (existing && existing.uid === uid) {
-    const dead = !isAlive(existing.pid);
-    const expired = nowMs > existing.start_ms + existing.timeout_ms + graceMs;
-    if (dead && expired) {
-      try {
-        fs.unlinkSync(lockPath);
-      } catch {
-        // ENOENT: someone else already reclaimed it; fall through to retry.
+  if (attemptsLeft <= 0) return { ok: false, release: NOOP_RELEASE };
+
+  if (expectedStale) {
+    const stillThere = readLockBody(lockPath);
+    if (!sameEntry(stillThere, expectedStale)) {
+      // Content changed since we decided it was safe to reclaim — never
+      // unlink blindly. Re-derive the decision from what's there now.
+      if (isStale(stillThere, uid, nowMs, graceMs)) {
+        return claimLock(lockPath, stillThere, opts, attemptsLeft - 1);
       }
-      result = exclusiveLinkCreate(lockPath, body);
-      if (result.ok) return { ok: true, release: () => releaseOwn(lockPath, pid, nowMs) };
+      return { ok: false, release: NOOP_RELEASE }; // now live/foreign/gone -> fail-closed
+    }
+    try {
+      fs.unlinkSync(lockPath);
+    } catch {
+      // ENOENT: someone else already reclaimed it; fall through to retry.
     }
   }
 
-  return { ok: false };
+  const body = JSON.stringify({ pid, uid, start_ms: nowMs, timeout_ms: timeoutMs });
+  const created = exclusiveLinkCreate(lockPath, body);
+  if (created.ok) return { ok: true, release: () => releaseOwn(lockPath, pid, nowMs) };
+
+  const raced = readLockBody(lockPath);
+  if (isStale(raced, uid, nowMs, graceMs)) {
+    return claimLock(lockPath, raced, opts, attemptsLeft - 1);
+  }
+  return { ok: false, release: NOOP_RELEASE };
 }
 
 function releaseOwn(lockPath, pid, startMs) {

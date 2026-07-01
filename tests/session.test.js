@@ -68,13 +68,56 @@ test('ensureSessionLease recreates the lease for the current pid when the old le
   assert.equal(lease.start_ms, 2000);
 });
 
+test('ensureSessionLease does not clobber a live lease that appears mid-reclaim (simulated TOCTOU race)', () => {
+  const stateDir = mkStateDir();
+  const filePath = path.join(stateDir, 'sessions', 'sid-race.json');
+  const deadBody = JSON.stringify({ pid: 999999, uid: process.getuid(), start_ms: 1, renewed_ms: 1 });
+  // pid 1 (init/launchd) is always alive and guaranteed different from ours.
+  const liveBody = JSON.stringify({ pid: 1, uid: process.getuid(), start_ms: 500, renewed_ms: 500 });
+  fs.writeFileSync(filePath, deadBody);
+
+  const originalReadFileSync = fs.readFileSync;
+  let callCount = 0;
+  fs.readFileSync = function (p, ...args) {
+    if (p === filePath) {
+      callCount += 1;
+      // 1st read: ensureSessionLease's initial existing-check sees the dead
+      // lease. 2nd read: claimLease's re-verify-before-unlink — simulate a
+      // concurrent claimant having replaced it with a live lease by then.
+      if (callCount === 2) {
+        originalReadFileSync !== fs.readFileSync && fs.writeFileSync(filePath, liveBody);
+        return liveBody;
+      }
+    }
+    return originalReadFileSync.call(fs, p, ...args);
+  };
+
+  try {
+    assert.throws(
+      () =>
+        ensureSessionLease(stateDir, 'sid-race', {
+          pid: process.pid,
+          uid: process.getuid(),
+          nowMs: 2000,
+        }),
+      SidCollisionError
+    );
+  } finally {
+    fs.readFileSync = originalReadFileSync;
+  }
+
+  // The racing writer's live lease must survive untouched — the fixed code
+  // must re-verify before unlinking rather than deleting blindly.
+  assert.equal(fs.readFileSync(filePath, 'utf8'), liveBody);
+});
+
 test('gcSessions removes leases whose pid is dead and past staleness window', () => {
   const stateDir = mkStateDir();
   fs.writeFileSync(
     path.join(stateDir, 'sessions', 'sid-dead.json'),
     JSON.stringify({ pid: 999999, uid: process.getuid(), start_ms: 0, renewed_ms: 0 })
   );
-  gcSessions(stateDir, { nowMs: 999_999_999, sessionStaleSeconds: 86400 });
+  gcSessions(stateDir, { nowMs: 999_999_999, uid: process.getuid(), sessionStaleSeconds: 86400 });
   assert.ok(!fs.existsSync(path.join(stateDir, 'sessions', 'sid-dead.json')));
 });
 
@@ -84,7 +127,7 @@ test('gcSessions keeps leases for live pids even if renewed_ms is old', () => {
     path.join(stateDir, 'sessions', 'sid-live.json'),
     JSON.stringify({ pid: process.pid, uid: process.getuid(), start_ms: 0, renewed_ms: 0 })
   );
-  gcSessions(stateDir, { nowMs: 999_999_999, sessionStaleSeconds: 86400 });
+  gcSessions(stateDir, { nowMs: 999_999_999, uid: process.getuid(), sessionStaleSeconds: 86400 });
   assert.ok(fs.existsSync(path.join(stateDir, 'sessions', 'sid-live.json')));
 });
 
@@ -94,6 +137,48 @@ test('gcSessions keeps leases that are dead but not yet past the staleness windo
     path.join(stateDir, 'sessions', 'sid-recent-dead.json'),
     JSON.stringify({ pid: 999999, uid: process.getuid(), start_ms: 0, renewed_ms: 900_000 })
   );
-  gcSessions(stateDir, { nowMs: 1_000_000, sessionStaleSeconds: 86400 });
+  gcSessions(stateDir, { nowMs: 1_000_000, uid: process.getuid(), sessionStaleSeconds: 86400 });
   assert.ok(fs.existsSync(path.join(stateDir, 'sessions', 'sid-recent-dead.json')));
+});
+
+test('gcSessions keeps a stale dead-pid lease belonging to a different uid', () => {
+  const stateDir = mkStateDir();
+  fs.writeFileSync(
+    path.join(stateDir, 'sessions', 'sid-foreign-uid.json'),
+    JSON.stringify({ pid: 999999, uid: process.getuid() + 1, start_ms: 0, renewed_ms: 0 })
+  );
+  gcSessions(stateDir, { nowMs: 999_999_999, uid: process.getuid(), sessionStaleSeconds: 86400 });
+  assert.ok(fs.existsSync(path.join(stateDir, 'sessions', 'sid-foreign-uid.json')));
+});
+
+test('gcSessions does not delete a lease that was reclaimed (became live) mid-scan (simulated TOCTOU race)', () => {
+  const stateDir = mkStateDir();
+  const filePath = path.join(stateDir, 'sessions', 'sid-gc-race.json');
+  const deadBody = JSON.stringify({ pid: 999999, uid: process.getuid(), start_ms: 0, renewed_ms: 0 });
+  const liveBody = JSON.stringify({ pid: 1, uid: process.getuid(), start_ms: 500, renewed_ms: 500 });
+  fs.writeFileSync(filePath, deadBody);
+
+  const originalReadFileSync = fs.readFileSync;
+  let callCount = 0;
+  fs.readFileSync = function (p, ...args) {
+    if (p === filePath) {
+      callCount += 1;
+      // 1st read: gcSessions' staleness/liveness evaluation sees the dead
+      // lease. 2nd read: the re-verify-before-unlink — simulate a
+      // concurrent reclaim having replaced it with a live lease by then.
+      if (callCount === 2) {
+        fs.writeFileSync(filePath, liveBody);
+        return liveBody;
+      }
+    }
+    return originalReadFileSync.call(fs, p, ...args);
+  };
+
+  try {
+    gcSessions(stateDir, { nowMs: 999_999_999, uid: process.getuid(), sessionStaleSeconds: 86400 });
+  } finally {
+    fs.readFileSync = originalReadFileSync;
+  }
+
+  assert.equal(fs.readFileSync(filePath, 'utf8'), liveBody);
 });

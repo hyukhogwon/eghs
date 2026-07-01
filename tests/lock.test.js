@@ -125,3 +125,64 @@ test('release() does not remove a lock that was reclaimed by someone else in the
   result.release();
   assert.ok(fs.existsSync(lockPath));
 });
+
+test('a failed acquireStopLock still returns a release() that is safe to call unconditionally', () => {
+  const stateDir = mkStateDir();
+  const first = acquireStopLock(stateDir, 'sid-8', {
+    pid: process.pid,
+    uid: process.getuid(),
+    timeoutMs: 45000,
+    nowMs: 1000,
+  });
+  const second = acquireStopLock(stateDir, 'sid-8', {
+    pid: process.pid,
+    uid: process.getuid(),
+    timeoutMs: 45000,
+    nowMs: 1500,
+  });
+  assert.equal(second.ok, false);
+  assert.equal(typeof second.release, 'function');
+  assert.doesNotThrow(() => second.release());
+  first.release();
+});
+
+test('acquireStopLock does not clobber a live lock that appears mid-reclaim (simulated TOCTOU race)', () => {
+  const stateDir = mkStateDir();
+  const lockPath = path.join(stateDir, 'locks', 'stop-sid-9.lock');
+  const deadBody = JSON.stringify({ pid: 999999, uid: process.getuid(), start_ms: 0, timeout_ms: 100 });
+  // pid 1 (init/launchd) is always alive and guaranteed different from ours.
+  const liveBody = JSON.stringify({ pid: 1, uid: process.getuid(), start_ms: 500, timeout_ms: 45000 });
+  fs.writeFileSync(lockPath, deadBody);
+
+  const originalReadFileSync = fs.readFileSync;
+  let callCount = 0;
+  fs.readFileSync = function (p, ...args) {
+    if (p === lockPath) {
+      callCount += 1;
+      // 1st read: initial staleness decision sees the dead lock. 2nd read:
+      // the re-verify-before-unlink — simulate a concurrent reclaimer
+      // having replaced it with a live lock by then.
+      if (callCount === 2) {
+        fs.writeFileSync(lockPath, liveBody);
+        return liveBody;
+      }
+    }
+    return originalReadFileSync.call(fs, p, ...args);
+  };
+
+  let result;
+  try {
+    result = acquireStopLock(stateDir, 'sid-9', {
+      pid: process.pid,
+      uid: process.getuid(),
+      timeoutMs: 45000,
+      nowMs: 10_000,
+    });
+  } finally {
+    fs.readFileSync = originalReadFileSync;
+  }
+
+  assert.equal(result.ok, false);
+  // The racing reclaimer's live lock must survive untouched.
+  assert.equal(fs.readFileSync(lockPath, 'utf8'), liveBody);
+});

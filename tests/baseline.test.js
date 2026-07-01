@@ -64,6 +64,45 @@ test('ensureBaseline throws SidCollisionError when anchor mismatches a live fore
   );
 });
 
+test('ensureBaseline does not clobber a live anchor that appears mid-reclaim (simulated TOCTOU race)', () => {
+  const stateDir = mkStateDir();
+  const filePath = path.join(stateDir, 'baselines', 'sid-6.txt');
+  const deadBody = JSON.stringify({ commit: 'deadbeef', lease_start_ms: 1, lease_pid: 999999 });
+  // pid 1 (init/launchd) is always alive and guaranteed different from ours.
+  const liveBody = JSON.stringify({ commit: 'cafef00d', lease_start_ms: 500, lease_pid: 1 });
+  fs.writeFileSync(filePath, deadBody);
+
+  const originalReadFileSync = fs.readFileSync;
+  let callCount = 0;
+  fs.readFileSync = function (p, ...args) {
+    if (p === filePath) {
+      callCount += 1;
+      // 1st read: ensureBaseline's initial anchor check sees the dead
+      // entry. 2nd read: claimBaseline's re-verify-before-unlink —
+      // simulate a concurrent claimant having replaced it with a live
+      // anchor by then.
+      if (callCount === 2) {
+        fs.writeFileSync(filePath, liveBody);
+        return liveBody;
+      }
+    }
+    return originalReadFileSync.call(fs, p, ...args);
+  };
+
+  const lease = { pid: process.pid, start_ms: 2000 };
+  try {
+    assert.throws(
+      () => ensureBaseline(stateDir, 'sid-6', { lease, repoRoot: '/tmp/no-git-here' }),
+      SidCollisionError
+    );
+  } finally {
+    fs.readFileSync = originalReadFileSync;
+  }
+
+  // The racing claimant's live anchor must survive untouched.
+  assert.equal(fs.readFileSync(filePath, 'utf8'), liveBody);
+});
+
 test('ensureBaseline resolves the real HEAD commit inside an actual git repo', () => {
   const { execFileSync } = require('child_process');
   const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'eghs-baseline-git-'));
