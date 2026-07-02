@@ -2,7 +2,8 @@
 
 Evidence-Gated Hook System for Claude Code. See `PRD.md` for the full spec.
 
-Currently implemented: **P1 — Stop hook** (typecheck/lint/test verification gate).
+Currently implemented: **P1 — Stop hook** (typecheck/lint/test verification gate)
+and **P2 — UserPromptSubmit** (fail-soft prompt-discipline injection).
 
 ## Setup
 
