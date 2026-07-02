@@ -17,7 +17,7 @@ function markerPath(stateDir, key, sid) {
     // Defense-in-depth: entrypoints validate session_id as UUIDv4, but sid
     // becomes a directory name here — never let a stray value traverse out
     // of failed/. Throwing lands in the callers' best-effort catch (= skip).
-    if (typeof sid !== 'string' || !/^[0-9a-f-]+$/i.test(sid)) {
+    if (typeof sid !== 'string' || !/^[0-9a-f-]+$/.test(sid)) {
       throw new Error(`unsafe sid for marker path: ${sid}`);
     }
     return path.join(stateDir, 'failed', sid, `${keyHash(key)}.json`);
