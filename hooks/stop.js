@@ -11,9 +11,7 @@ const { ensureSessionLease, gcSessions, SidCollisionError } = require('./lib/ses
 const { ensureBaseline } = require('./lib/baseline');
 const { runVerification } = require('./lib/verify');
 const { appendDebugLog } = require('./lib/debug-log');
-
-const SID_REGEX =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const { isValidSid } = require('./lib/sid');
 
 function emit(exitCode, decision, extra) {
   // Claude Code's Stop-hook contract: exit 0 + EMPTY stdout allows the stop
@@ -81,7 +79,7 @@ async function main() {
   }
 
   const sid = input.session_id;
-  if (typeof sid !== 'string' || !SID_REGEX.test(sid)) {
+  if (!isValidSid(sid)) {
     // NO_SESSION signal (PRD §R2.5): allow, but skip all state work.
     // This is a fail-open path, and Claude Code only guarantees session_id
     // is a string (not UUIDv4) — keep it observable on stderr so a host-side

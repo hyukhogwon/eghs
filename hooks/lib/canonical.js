@@ -1,6 +1,7 @@
 'use strict';
 const crypto = require('crypto');
 const fs = require('fs');
+const path = require('path');
 
 // Canonical key (PRD §R2): realpath resolves symlinks and ./.. segments,
 // then lowercase iff the state dir's fs-info cache says the filesystem is
@@ -17,6 +18,35 @@ function canonicalKey(filePath, { caseless }) {
     return { ok: false, code: 'FILE_UNREADABLE', missing: err.code === 'ENOENT' };
   }
   return { ok: true, key: caseless ? resolved.toLowerCase() : resolved };
+}
+
+// Deep-new-path canonical key (PRD §R3): when the file does not exist yet
+// (new Write intent), walk up to the first existing ancestor, realpath it,
+// and re-append the not-yet-existing segments. `missing: true` on the ok
+// result tells the caller to record pre_sha: null.
+function canonicalKeyAllowMissing(filePath, { caseless }) {
+  const direct = canonicalKey(filePath, { caseless });
+  if (direct.ok) return { ...direct, missing: false };
+  if (!direct.missing) return direct; // EACCES-class: not a new-file case
+  const pending = [];
+  let p = path.resolve(filePath);
+  while (true) {
+    pending.unshift(path.basename(p));
+    const parent = path.dirname(p);
+    if (parent === p) return { ok: false, code: 'FILE_UNREADABLE', missing: true };
+    let real;
+    try {
+      real = fs.realpathSync(parent);
+    } catch (err) {
+      if (err.code === 'ENOENT') {
+        p = parent;
+        continue;
+      }
+      return { ok: false, code: 'FILE_UNREADABLE', missing: false };
+    }
+    const key = path.join(real, ...pending);
+    return { ok: true, key: caseless ? key.toLowerCase() : key, missing: true };
+  }
 }
 
 // reads/failed state filenames are sha1(canonical_key) hex (PRD §R2.5).
@@ -54,4 +84,4 @@ function sha256File(filePath) {
   }
 }
 
-module.exports = { canonicalKey, keyHash, sha256File };
+module.exports = { canonicalKey, canonicalKeyAllowMissing, keyHash, sha256File };
