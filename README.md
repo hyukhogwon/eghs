@@ -20,7 +20,7 @@ Configure verification commands in `.claude/eghs.config.json`:
 }
 ```
 
-The Stop hook is registered in `.claude/settings.json`. Make sure `.claude/state/` is
+The Stop and UserPromptSubmit hooks are registered in `.claude/settings.json`. Make sure `.claude/state/` is
 gitignored (state includes session leases, locks, and verification logs, not source).
 
 ## Kill switch

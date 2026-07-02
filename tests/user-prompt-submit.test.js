@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawnSync, execFileSync } = require('child_process');
+const { spawnSync, execFileSync, spawn } = require('child_process');
 
 const HOOK = path.join(__dirname, '..', 'hooks', 'user-prompt-submit.js');
 const INIT = path.join(__dirname, '..', 'hooks', 'init.js');
@@ -109,4 +109,25 @@ test('missing session_id still injects principles (P2 needs no sid), exit 0', ()
   const { stdout, code } = run(repo, { input: {} });
   assert.equal(code, 0);
   assert.match(JSON.parse(stdout).hookSpecificOutput.additionalContext, /Read it first/);
+});
+
+test('EPIPE on stdout (reader gone) still exits 0 (fail-soft)', async () => {
+  const repo = mkRepo();
+  initRepo(repo);
+  const child = spawn('node', [HOOK], {
+    env: {
+      ...process.env,
+      CLAUDE_PROJECT_DIR: repo,
+      CI: '',
+      GITHUB_ACTIONS: '',
+      GITLAB_CI: '',
+      BUILDKITE: '',
+      EGHS_DISABLED: '',
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  child.stdout.destroy(); // reader disappears before the hook writes
+  child.stdin.end(JSON.stringify({ session_id: SID, user_input: 'hi' }));
+  const code = await new Promise((resolve) => child.on('close', resolve));
+  assert.equal(code, 0);
 });

@@ -11,6 +11,11 @@ const {
   buildAdditionalContext,
 } = require('./lib/prompt-discipline');
 
+// A dying host can close the stdout pipe before we write; the resulting EPIPE
+// arrives as an async 'error' event that no sync try/catch can intercept —
+// swallow it so the fail-soft exit-0 guarantee holds even then.
+process.stdout.on('error', () => {});
+
 // Duplicated from hooks/stop.js on purpose — see plan Global Constraints.
 function readStdin() {
   const chunks = [];

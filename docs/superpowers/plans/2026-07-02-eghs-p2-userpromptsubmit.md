@@ -40,7 +40,7 @@ tests/
 README.md                  # MODIFY: note P2 implemented
 ```
 
-P2 is a single review unit (Tasks 1–4). After Task 4, run one review checkpoint (`/code-review` senior + a Codex review agent on the P2 diff), fix all Critical/Major, re-run `node --test tests/`, and run the Task 4 smoke test — matching P1's per-unit review discipline.
+P2 is a single review unit (Tasks 1–4). After Task 4, run one review checkpoint (`/code-review` senior + a Codex review agent on the P2 diff), fix all Critical/Major, re-run `npm test`, and run the Task 4 smoke test — matching P1's per-unit review discipline.
 
 ---
 
@@ -457,7 +457,7 @@ Expected: PASS (8/8).
 
 - [ ] **Step 5: Run the whole suite (no regressions in P1)**
 
-Run: `node --test tests/`
+Run: `npm test`
 Expected: PASS (P1's 96 tests + P2's 16 = 112).
 
 - [ ] **Step 6: Commit**
@@ -550,7 +550,7 @@ git commit -m "chore: register UserPromptSubmit hook, note P2 in README"
 
 ---
 
-**— P2 (UserPromptSubmit) checkpoint —** After Task 4, run `/code-review` (senior review) and dispatch a Codex review agent against the full P2 diff (Tasks 1–4). Fix all Critical/Major findings, re-run `node --test tests/`, and re-run the Task 4 smoke test. Then P2 is done and the rollout can advance to P3.
+**— P2 (UserPromptSubmit) checkpoint —** After Task 4, run `/code-review` (senior review) and dispatch a Codex review agent against the full P2 diff (Tasks 1–4). Fix all Critical/Major findings, re-run `npm test`, and re-run the Task 4 smoke test. Then P2 is done and the rollout can advance to P3.
 
 ---
 
