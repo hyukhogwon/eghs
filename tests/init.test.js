@@ -27,6 +27,63 @@ test('eghs-init bootstraps schema_version and all P1 subdirs', () => {
   }
 });
 
+test('eghs-init bootstraps the P3 state-writer subdirs', () => {
+  const repo = mkTmpRepo();
+  run([], repo);
+  const stateDir = path.join(repo, '.claude', 'state', 'eghs');
+  for (const sub of ['reads', path.join('reads', 'tmp'), 'failed', path.join('failed', 'tmp'), 'pre']) {
+    assert.ok(fs.statSync(path.join(stateDir, sub)).isDirectory(), sub);
+  }
+});
+
+test('eghs-init writes fs-info.json (boolean caseless_fs) and removes the probe files', () => {
+  const repo = mkTmpRepo();
+  run([], repo);
+  const stateDir = path.join(repo, '.claude', 'state', 'eghs');
+  const info = JSON.parse(fs.readFileSync(path.join(stateDir, 'fs-info.json'), 'utf8'));
+  assert.equal(info.schema_version, 1);
+  assert.equal(typeof info.caseless_fs, 'boolean');
+  assert.equal(typeof info.ts_ms, 'number');
+  assert.ok(!fs.existsSync(path.join(stateDir, '.cs-probe')));
+  assert.ok(!fs.existsSync(path.join(stateDir, '.CS-PROBE')));
+});
+
+test('eghs-init --repair recreates a missing fs-info.json', () => {
+  const repo = mkTmpRepo();
+  run([], repo);
+  const infoPath = path.join(repo, '.claude', 'state', 'eghs', 'fs-info.json');
+  fs.rmSync(infoPath);
+  run(['--repair'], repo);
+  assert.equal(typeof JSON.parse(fs.readFileSync(infoPath, 'utf8')).caseless_fs, 'boolean');
+});
+
+test('eghs-init --repair keeps a healthy fs-info.json untouched (no re-probe)', () => {
+  const repo = mkTmpRepo();
+  run([], repo);
+  const infoPath = path.join(repo, '.claude', 'state', 'eghs', 'fs-info.json');
+  const custom = JSON.stringify({ schema_version: 1, caseless_fs: false, ts_ms: 42 });
+  fs.writeFileSync(infoPath, custom);
+  run(['--repair'], repo);
+  assert.equal(fs.readFileSync(infoPath, 'utf8'), custom);
+});
+
+test('eghs-init survives stale probe leftovers from a crashed previous run', () => {
+  const repo = mkTmpRepo();
+  const stateDir = path.join(repo, '.claude', 'state', 'eghs');
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, '.CS-PROBE'), '');
+  run([], repo);
+  assert.ok(!fs.existsSync(path.join(stateDir, '.CS-PROBE')));
+  // Verdict must match a clean-room probe, not be poisoned by the leftover.
+  const fresh = mkTmpRepo();
+  run([], fresh);
+  const verdict = (repo2) =>
+    JSON.parse(
+      fs.readFileSync(path.join(repo2, '.claude', 'state', 'eghs', 'fs-info.json'), 'utf8')
+    ).caseless_fs;
+  assert.equal(verdict(repo), verdict(fresh));
+});
+
 test('eghs-init refuses to run twice without --repair', () => {
   const repo = mkTmpRepo();
   run([], repo);

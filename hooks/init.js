@@ -2,8 +2,9 @@
 'use strict';
 const fs = require('fs');
 const path = require('path');
-const { resolveStateDir, P1_SUBDIRS } = require('./lib/state-dir');
+const { resolveStateDir, STATE_SUBDIRS } = require('./lib/state-dir');
 const { readSchemaVersion, HOOK_SCHEMA_VERSION } = require('./lib/schema');
+const { readFsInfo, probeAndWriteFsInfo } = require('./lib/fs-info');
 const { atomicWriteFile } = require('./lib/atomic-write');
 const { getRepoRoot } = require('./lib/git');
 
@@ -65,8 +66,16 @@ function main(argv) {
       }
     }
 
-    for (const sub of P1_SUBDIRS) {
+    for (const sub of STATE_SUBDIRS) {
       fs.mkdirSync(path.join(stateDir, sub), { recursive: true, mode: 0o700 });
+    }
+
+    // Probe before schema_version: schema presence is the single "all infra
+    // ready" signal (PRD §R2.5 init step 7), so fs-info.json must exist first.
+    // A healthy cache is kept as-is — the filesystem's case behavior can't
+    // change under a live state dir, so --repair only fixes missing/corrupt.
+    if (readFsInfo(stateDir).status !== 'ok') {
+      probeAndWriteFsInfo(stateDir, Date.now());
     }
 
     if (before.status === 'invalid' || before.status === 'not_initialized') {
