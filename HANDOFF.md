@@ -39,6 +39,15 @@ Evidence-Gated Hook System for Claude Code. Rollout per PRD §6:
 3. **Zero-commit git repo edge (P1/Stop)** — fresh repo with no commits → `git diff HEAD` fails → confusing `INFRA_NOT_READY`. Known limitation, fix opportunistically.
 4. Minor: one test for `CLAUDE_PROJECT_DIR` unset → cwd fallback; tests leave `mkdtemp` dirs (OS-reaped, matches suite convention).
 
+## Deferred: Codex CLI Port (comes AFTER P4)
+
+User decision 2026-07-02: make EGHS usable from OpenAI Codex CLI, but only once every
+Claude Code phase is done. Research is complete and preserved in
+`docs/research/2026-07-02-codex-hooks-research.md` — Codex ships a Claude Code-compatible
+hooks.json subsystem (same events/exit-2-stderr contract), so the port is mostly
+registration (`.codex/hooks.json`, trust-gated) plus small payload/env deltas. Re-verify
+against the then-installed Codex version before designing.
+
 ## P3 Pointers
 
 - Spec: PRD §R2 (Read state recording, lines 88-173), §R2.5 (state dir layout — `reads/`, `failed/`, `pre/` subdirs deferred from P1), §R4 (Edit state update). P3 is "gate off, state 기록만" — no denies yet.
