@@ -14,7 +14,7 @@ Evidence-Gated Hook System for Claude Code. Rollout per PRD §6:
 | P4 | Edit state-gate on core source paths | NOT STARTED |
 
 - Branch: `main`, pushed to https://github.com/hyukhogwon/eghs (public). HEAD at P2 completion: `e1371d7`.
-- Suite: **113/113** via `npm test`. Do NOT use `node --test tests/` (bare directory form) — broken on Node v24; single-file `node --test tests/<file>.js` works.
+- Suite: **115/115** via `npm test`. Do NOT use `node --test tests/` (bare directory form) — broken on Node v24; single-file `node --test tests/<file>.js` works.
 - Both hooks are registered in `.claude/settings.json` and live in this repo's own Claude Code sessions (dogfooding: the `[EGHS] Working agreement` system reminder each turn is P2 working).
 
 ## Process Conventions (established across P1/P2, keep for P3)
@@ -31,6 +31,9 @@ Evidence-Gated Hook System for Claude Code. Rollout per PRD §6:
 - UserPromptSubmit writes no state, runs no git; repo root = `CLAUDE_PROJECT_DIR || cwd`.
 - `$CLAUDE_PROJECT_DIR` in settings.json hook commands has no shell fallback — reviewed, user decided keep-as-is (Claude Code always sets it; symmetric with P1).
 - Stop output contract (fixed 2026-07-02): allow = exit 0 + EMPTY stdout (Claude Code's zod output schema rejects `decision:"allow"` — enum is `approve|block`); block = exit 2 + reason on STDERR (`[eghs] block <deny_code>: <reason>` + per-check lines — stdout is not parsed on exit 2). UserPromptSubmit stdout carries only the `hookSpecificOutput` envelope. All other diagnostics stderr-only.
+- **Glob semantics are bash-glob (picomatch v4, `{ dot: true }`), NOT gitignore(5)** — user decision 2026-07-02 after a spec audit proved picomatch has no `gitignore` option (PRD §R4 amended; nested matches need `**/`, no trailing-`/` dirs, no order-dependent `!` negation). Non-ASCII filenames are handled by forcing `core.quotePath=false` in every git call (hooks/lib/git.js).
+- **verify.js timeout design is deliberate**: manual timer + detached process-group SIGTERM→SIGKILL (hooks/lib/verify.js). Do NOT "simplify" to child_process's built-in `timeout` option — it signals only the direct child and leaks grandchildren.
+- No `CLAUDE_CODE_PID` env var exists in Claude Code (verified v2.1.198); lease/lock pid is `process.ppid` by design. NO_SESSION fail-open path logs `[eghs] NO_SESSION` to stderr for observability (docs only guarantee session_id is a string, not UUIDv4).
 
 ## Carried Items for P3 (from final P2 review, adjudicated)
 

@@ -101,14 +101,21 @@ async function main() {
   const sid = input.session_id;
   if (typeof sid !== 'string' || !SID_REGEX.test(sid)) {
     // NO_SESSION signal (PRD §R2.5): allow, but skip all state work.
+    // This is a fail-open path, and Claude Code only guarantees session_id
+    // is a string (not UUIDv4) — keep it observable on stderr so a host-side
+    // format change doesn't silently disable gating forever.
+    process.stderr.write(`[eghs] NO_SESSION: missing/invalid session_id — verification gating skipped\n`);
     emit(0, { decision: 'allow', reason: 'no valid session_id (NO_SESSION)' });
     return;
   }
 
   const nowMs = Date.now();
   const uid = process.getuid();
-  const envPid = Number(process.env.CLAUDE_CODE_PID);
-  const pid = Number.isInteger(envPid) && envPid > 0 ? envPid : process.ppid;
+  // The direct parent is the closest thing to a host pid we get: no
+  // CLAUDE_CODE_PID-style env var exists (verified against Claude Code
+  // v2.1.198, 2026-07-02 spec audit). Lease staleness detection only needs
+  // a pid whose death implies the invoking session is gone.
+  const pid = process.ppid;
 
   let lease;
   let baseline;
@@ -225,6 +232,9 @@ async function main() {
 }
 
 main().catch((err) => {
-  process.stderr.write(`[eghs] stop hook crashed: ${err.stack || err.message}\n`);
-  process.exit(1);
+  // exit(1) right after an async pipe write can truncate the diagnostic —
+  // the same flush window emit() avoids. Waiting for natural exit is not an
+  // option here (a crash may leave open handles, e.g. a hung verification
+  // child), so exit from the write callback, which fires after the flush.
+  process.stderr.write(`[eghs] stop hook crashed: ${err.stack || err.message}\n`, () => process.exit(1));
 });

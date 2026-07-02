@@ -3,7 +3,13 @@ const { execFileSync } = require('child_process');
 const picomatch = require('picomatch');
 
 function git(args, cwd) {
-  return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
+  // core.quotePath defaults to true, which C-quotes non-ASCII filenames
+  // ("\355\225\234...") in diff/ls-files output — those strings never match
+  // any glob, silently disabling skip/gate matching for e.g. Korean names.
+  return execFileSync('git', ['-c', 'core.quotePath=false', ...args], {
+    cwd,
+    encoding: 'utf8',
+  }).trim();
 }
 
 function getRepoRoot(cwd) {
@@ -55,8 +61,12 @@ function getChangedFiles(repoRoot, diffBase) {
 }
 
 function shouldSkipVerification(changedFiles, skipGlobs) {
-  if (changedFiles.length === 0 || skipGlobs.length === 0) return false;
-  const isMatch = picomatch(skipGlobs, { dot: true });
+  // picomatch throws on empty/non-string patterns; a bad config entry must
+  // degrade to "run verification" (fail-safe), not crash the Stop hook —
+  // a crash exits 1, which Claude Code treats as non-blocking (fail-open).
+  const globs = skipGlobs.filter((g) => typeof g === 'string' && g.length > 0);
+  if (changedFiles.length === 0 || globs.length === 0) return false;
+  const isMatch = picomatch(globs, { dot: true });
   return changedFiles.every((f) => isMatch(f));
 }
 

@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { execFileSync } = require('child_process');
+const { execFileSync, spawnSync } = require('child_process');
 
 const STOP_SCRIPT = path.join(__dirname, '..', 'hooks', 'stop.js');
 const INIT_SCRIPT = path.join(__dirname, '..', 'hooks', 'init.js');
@@ -39,17 +39,13 @@ function writeConfig(repo, config) {
 // stop (any JSON with decision:"allow" fails Claude Code's output schema);
 // exit 2 blocks, with the reason on STDERR (stdout is not parsed on exit 2).
 function runStop(repo, input, extraEnv = {}) {
-  try {
-    const stdout = execFileSync('node', [STOP_SCRIPT], {
-      cwd: repo,
-      input: JSON.stringify(input),
-      encoding: 'utf8',
-      env: { ...process.env, ...extraEnv },
-    });
-    return { exitCode: 0, stdout, stderr: '' };
-  } catch (err) {
-    return { exitCode: err.status, stdout: err.stdout, stderr: err.stderr };
-  }
+  const r = spawnSync('node', [STOP_SCRIPT], {
+    cwd: repo,
+    input: JSON.stringify(input),
+    encoding: 'utf8',
+    env: { ...process.env, ...extraEnv },
+  });
+  return { exitCode: r.status, stdout: r.stdout, stderr: r.stderr };
 }
 
 test('allows (exit 0) with EMPTY stdout when verification commands all pass', () => {
@@ -153,9 +149,12 @@ test('missing/invalid session_id allows (NO_SESSION signal) without touching sta
   const repo = mkRepo();
   execFileSync('node', [INIT_SCRIPT], { cwd: repo });
   writeConfig(repo, { verification_commands: { lint: 'false' } });
-  const { exitCode, stdout } = runStop(repo, { session_id: 'not-a-uuid' });
+  const { exitCode, stdout, stderr } = runStop(repo, { session_id: 'not-a-uuid' });
   assert.equal(exitCode, 0);
   assert.equal(stdout, '');
+  // Fail-open path must be observable: docs only guarantee session_id is a
+  // string, so a format change would land here silently otherwise.
+  assert.match(stderr, /NO_SESSION/);
   const stateDir = path.join(repo, '.claude', 'state', 'eghs');
   assert.ok(!fs.existsSync(path.join(stateDir, 'sessions', 'not-a-uuid.json')));
 });

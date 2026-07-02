@@ -371,16 +371,15 @@ State는 `.claude/state/eghs/` 아래 다음 구조로 저장한다.
 
 **`state_gate_paths` 매칭 문법**:
 
-* gitignore-style glob 리스트. `**/*.ts`, `!**/*.d.ts` 형태.
+* **bash-glob 리스트 (picomatch v4 문법 — gitignore(5) 스펙이 아니다).** `**/*.ts`, `!**/*.d.ts` 형태.
 * 매칭은 repo root 기준 상대 경로(`canonical_key` - `repo_root`).
 * repo root는 `git rev-parse --show-toplevel` 결과. git이 아니면 hook config의 `repo_root` 또는 cwd.
-* gitignore syntax는 [gitignore(5) man page, Git 2.40+](https://git-scm.com/docs/gitignore)의 공식 명세를 따른다.
-* 구현 라이브러리(Node `picomatch` with `{ dot: true, gitignore: true }`, Python `pathspec` with `GitIgnoreSpec`)는 다음 케이스에서 동일 결과를 내야 한다(MVP test corpus):
-    1. `**/foo` 와 `foo`의 차이.
-    2. `!` 부정 패턴의 우선순위(나중 패턴이 이김).
-    3. trailing `/`로 디렉토리 한정.
-    4. `[!abc]` character class.
-* 두 라이브러리 합의가 실패하면 v5는 단일 reference 구현(picomatch)으로 통일한다. config에 `matcher_engine: "picomatch"`를 명시한다.
+* 구현은 Node `picomatch` 단일 reference, 옵션은 `{ dot: true }` 고정. config의 `matcher_engine: "picomatch"`는 이 reference 고정을 명시한다. (기존 초안의 gitignore(5) 준수 요구는 2026-07-02 spec audit에서 폐기 — picomatch에는 `gitignore` 옵션이 존재하지 않고 bash-glob 시맨틱만 제공한다.)
+* gitignore와의 실측 차이 — config 작성 시 주의:
+    1. `*.md`는 최상위 파일만 매칭한다. 중첩 매칭은 반드시 `**/*.md`로 쓴다.
+    2. trailing `/` 디렉토리 한정(`docs/`)은 동작하지 않는다. `docs/**`로 쓴다.
+    3. `!` 부정은 gitignore의 "나중 패턴이 이김" 순서 규칙이 아니라 패턴 배열의 OR 결합으로 평가된다. 순서 의존적인 부정 규칙 조합은 금지.
+    4. git 출력의 비ASCII 파일명 C-quoting은 hook이 `core.quotePath=false`로 무력화한다(매칭 전제).
 
 **Gate 조건**:
 
@@ -808,7 +807,7 @@ v5 MVP는 다음을 만족하면 완료로 본다.
     * Stop hook stdout: allow 시 빈 출력(Claude Code 스키마상 `decision:"allow"` JSON은 무효). UserPromptSubmit stdout: `hookSpecificOutput` envelope만.
     * stderr: block 시 `[eghs] block <deny_code>: <reason>` + check별 상세 라인(exit 2에서 Claude Code가 모델에 전달하는 유일한 채널), 그 외 자유 형식 디버그 메시지. 구조화 결정 기록은 `debug/` 로그가 담당.
 8. shellcheck 통과(Bash 구현 시) 또는 `tsc --noEmit` + `eslint` 통과(Node 구현 시). 구현 언어는 config 외 hook 코드 단위로 통일.
-9. `state_gate_paths`는 gitignore-style glob(gitignore(5) spec, picomatch reference)으로 명세된다.
+9. `state_gate_paths`는 bash-glob(picomatch v4, `{ dot: true }`)으로 명세된다. gitignore(5) 시맨틱이 아니다 — 중첩 매칭은 `**/` 접두 필수, trailing `/` 디렉토리 한정 미지원 (§R4 매칭 문법 참조).
 10. canonical path는 case-aware `realpath`(R2 참조), SHA는 디스크 raw bytes의 SHA-256으로 통일된다. case-sensitivity는 `eghs-init`이 1회 probe해 `fs-info.json`에 캐시한다.
 11. atomic state write는 **destination-local** `tmp/` 임시 파일 + `fsync(fd)` + same-dir `rename(2)` + `fsync(dirfd)` 절차를 따르며, 임시 파일명 suffix는 per-write 단조 카운터.
 12. cross-session 정책: `reads/` 공유, gate는 `sid` 일치 요구.

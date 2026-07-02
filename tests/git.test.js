@@ -66,6 +66,17 @@ test('getChangedFiles degrades to [] (does not throw) when repoRoot is not a git
   assert.deepEqual(getChangedFiles(dir, 'HEAD'), []);
 });
 
+test('getChangedFiles returns non-ASCII filenames raw, not C-quoted (core.quotePath)', () => {
+  const dir = mkGitRepo();
+  fs.writeFileSync(path.join(dir, '한글문서.md'), 'hi\n');
+  assert.deepEqual(getChangedFiles(dir, 'HEAD'), ['한글문서.md']);
+});
+
+test('shouldSkipVerification ignores empty/non-string glob entries instead of crashing (fail-safe)', () => {
+  assert.equal(shouldSkipVerification(['a.md'], ['']), false);
+  assert.equal(shouldSkipVerification(['a.md'], ['', null, '**/*.md']), true);
+});
+
 test('shouldSkipVerification is true when every changed file matches a skip glob', () => {
   assert.equal(
     shouldSkipVerification(['README.md', 'docs/x.md'], ['**/*.md', 'docs/**']),
