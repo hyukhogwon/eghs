@@ -34,19 +34,22 @@ function readStdin() {
 }
 
 function emit(exitCode, decision, extra) {
-  process.stdout.write(
-    JSON.stringify({
-      decision: decision.decision,
-      deny_code: decision.deny_code || null,
-      reason: decision.reason || null,
-      extra: extra || {},
-    })
-  );
+  // Claude Code's Stop-hook contract: exit 0 + EMPTY stdout allows the stop
+  // (its zod output schema only accepts decision "approve"|"block", so any
+  // {"decision":"allow"} JSON fails validation), and on exit 2 stdout is not
+  // parsed at all — the model receives STDERR as the blocking reason.
+  if (exitCode === 2) {
+    const lines = [`[eghs] block ${decision.deny_code || 'UNKNOWN'}: ${decision.reason || ''}`];
+    for (const r of (extra && extra.results) || []) {
+      lines.push(`  - ${r.name}: exit=${r.exitCode}${r.timedOut ? ' (timed out)' : ''}`);
+    }
+    process.stderr.write(lines.join('\n') + '\n');
+  }
   // Not process.exit(): on a pipe (the normal hook-invocation channel),
-  // Node does not guarantee a stdout write completes before exit() returns,
-  // which could truncate the decision JSON. Setting exitCode and returning
-  // lets the event loop drain (flushing stdout) before the process exits
-  // naturally — main() has no other open handles by this point.
+  // Node does not guarantee a pending write completes before exit() returns,
+  // which could truncate the reason. Setting exitCode and returning lets the
+  // event loop drain (flushing stderr) before the process exits naturally —
+  // main() has no other open handles by this point.
   process.exitCode = exitCode;
 }
 

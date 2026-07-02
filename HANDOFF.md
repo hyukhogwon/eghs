@@ -30,7 +30,7 @@ Evidence-Gated Hook System for Claude Code. Rollout per PRD §6:
 - CI passthrough applies to UserPromptSubmit but NOT Stop (PRD §6 line 688).
 - UserPromptSubmit writes no state, runs no git; repo root = `CLAUDE_PROJECT_DIR || cwd`.
 - `$CLAUDE_PROJECT_DIR` in settings.json hook commands has no shell fallback — reviewed, user decided keep-as-is (Claude Code always sets it; symmetric with P1).
-- stdout carries only the decision JSON (Stop) / `hookSpecificOutput` envelope (UserPromptSubmit); all diagnostics stderr-only.
+- Stop output contract (fixed 2026-07-02): allow = exit 0 + EMPTY stdout (Claude Code's zod output schema rejects `decision:"allow"` — enum is `approve|block`); block = exit 2 + reason on STDERR (`[eghs] block <deny_code>: <reason>` + per-check lines — stdout is not parsed on exit 2). UserPromptSubmit stdout carries only the `hookSpecificOutput` envelope. All other diagnostics stderr-only.
 
 ## Carried Items for P3 (from final P2 review, adjudicated)
 
@@ -51,7 +51,7 @@ Evidence-Gated Hook System for Claude Code. Rollout per PRD §6:
 ```bash
 npm test                                   # full suite, expect 113 passing
 printf '{"session_id":"11111111-1111-4111-8111-111111111111"}' \
-  | node hooks/stop.js; echo " exit=$?"    # Stop smoke (this repo: allow/exit 0 when clean)
+  | node hooks/stop.js; echo " exit=$?"    # Stop smoke (this repo: exit 0, EMPTY stdout when clean)
 printf '{}' | node hooks/user-prompt-submit.js; echo " exit=$?"  # UPS smoke: principles JSON + exit 0
 ```
 

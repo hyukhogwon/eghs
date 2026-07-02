@@ -537,7 +537,7 @@ PreToolUse가 위 deny code 중 어느 하나라도 반환할 때, 본인이 작
 
 **결과**:
 
-* 하나라도 non-zero exit이면 `{ "decision": "block", "reason": "<failed_check_names>" }`를 stdout으로 출력.
+* 하나라도 non-zero exit이면 exit 2 + **stderr**에 `[eghs] block <deny_code>: <reason>` 형식으로 실패 check 이름·exit code를 출력한다. (Claude Code Stop hook 계약: exit 2에서 stdout은 파싱되지 않고 stderr가 모델 피드백이 된다. allow는 exit 0 + 빈 stdout — `decision:"allow"` JSON은 Claude Code 출력 스키마(zod, decision enum `approve|block`)에 걸려 검증 실패한다.)
 * 실패 로그는 `.claude/state/eghs/verify-logs/<sid>/<name>.log`에 저장(stdout+stderr 합쳐서). 성공 실행도 동일 경로에 저장해 metric 측정/디버깅에 활용.
 
 **Recursion 방지**:
@@ -804,9 +804,9 @@ v5 MVP는 다음을 만족하면 완료로 본다.
 6. kill switch와 CI passthrough가 동작한다.
 7. 모든 hook은 stdin JSON 기반 dry-run 테스트가 가능하다.
     * Interface: `<hook-script> --dry-run < input.json`.
-    * stdout: `{ "decision": "allow|block|skip", "deny_code": "...|null", "reason": "...|null", "extra": {...} }`.
     * exit code enum: `0` = allow/skip/kill_switch, `2` = block(Claude Code spec), 기타 코드는 hook 자체 crash로 간주.
-    * stderr: 자유 형식 디버그 메시지(stdout과 엄격히 분리).
+    * Stop hook stdout: allow 시 빈 출력(Claude Code 스키마상 `decision:"allow"` JSON은 무효). UserPromptSubmit stdout: `hookSpecificOutput` envelope만.
+    * stderr: block 시 `[eghs] block <deny_code>: <reason>` + check별 상세 라인(exit 2에서 Claude Code가 모델에 전달하는 유일한 채널), 그 외 자유 형식 디버그 메시지. 구조화 결정 기록은 `debug/` 로그가 담당.
 8. shellcheck 통과(Bash 구현 시) 또는 `tsc --noEmit` + `eslint` 통과(Node 구현 시). 구현 언어는 config 외 hook 코드 단위로 통일.
 9. `state_gate_paths`는 gitignore-style glob(gitignore(5) spec, picomatch reference)으로 명세된다.
 10. canonical path는 case-aware `realpath`(R2 참조), SHA는 디스크 raw bytes의 SHA-256으로 통일된다. case-sensitivity는 `eghs-init`이 1회 probe해 `fs-info.json`에 캐시한다.
