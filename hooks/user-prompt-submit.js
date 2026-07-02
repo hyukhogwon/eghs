@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 'use strict';
-const fs = require('fs');
+const { readStdin } = require('./lib/stdin');
 const { resolveStateDir } = require('./lib/state-dir');
 const { readSchemaVersion } = require('./lib/schema');
 const { checkKillSwitch } = require('./lib/kill-switch');
@@ -15,25 +15,6 @@ const {
 // arrives as an async 'error' event that no sync try/catch can intercept —
 // swallow it so the fail-soft exit-0 guarantee holds even then.
 process.stdout.on('error', () => {});
-
-// Duplicated from hooks/stop.js on purpose — see plan Global Constraints.
-function readStdin() {
-  const chunks = [];
-  const buf = Buffer.alloc(65536);
-  while (true) {
-    let bytesRead;
-    try {
-      bytesRead = fs.readSync(0, buf, 0, buf.length, null);
-    } catch (err) {
-      if (err.code === 'EAGAIN') continue;
-      if (err.code === 'EOF') break;
-      throw err;
-    }
-    if (bytesRead === 0) break;
-    chunks.push(Buffer.from(buf.subarray(0, bytesRead)));
-  }
-  return Buffer.concat(chunks).toString('utf8');
-}
 
 // Emit additionalContext (or nothing) and exit 0. UserPromptSubmit is fail-soft:
 // the exit code is ALWAYS 0 — a non-zero (2) exit would erase the user's prompt.

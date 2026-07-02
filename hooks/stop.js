@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 'use strict';
-const fs = require('fs');
+const { readStdin } = require('./lib/stdin');
 const { resolveStateDir } = require('./lib/state-dir');
 const { readSchemaVersion } = require('./lib/schema');
 const { checkKillSwitch } = require('./lib/kill-switch');
@@ -14,24 +14,6 @@ const { appendDebugLog } = require('./lib/debug-log');
 
 const SID_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-
-function readStdin() {
-  const chunks = [];
-  const buf = Buffer.alloc(65536);
-  while (true) {
-    let bytesRead;
-    try {
-      bytesRead = fs.readSync(0, buf, 0, buf.length, null);
-    } catch (err) {
-      if (err.code === 'EAGAIN') continue;
-      if (err.code === 'EOF') break;
-      throw err;
-    }
-    if (bytesRead === 0) break;
-    chunks.push(Buffer.from(buf.subarray(0, bytesRead)));
-  }
-  return Buffer.concat(chunks).toString('utf8');
-}
 
 function emit(exitCode, decision, extra) {
   // Claude Code's Stop-hook contract: exit 0 + EMPTY stdout allows the stop
