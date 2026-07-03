@@ -10,12 +10,12 @@ Evidence-Gated Hook System for Claude Code. Rollout per PRD §6:
 |-------|-------|--------|
 | P1 | Stop hook — typecheck/lint/test verification gate | **DONE** (reviewed, 96 tests) |
 | P2 | UserPromptSubmit — fail-soft prompt-discipline injection | **DONE** (reviewed, +17 tests) |
-| P3 | PostToolUse Read/Edit state writer — gate off, records only | NOT STARTED |
+| P3 | Pre/PostToolUse Read/Edit state writer — gate off, records only | **DONE** (reviewed per unit, +85 tests) |
 | P4 | Edit state-gate on core source paths | NOT STARTED |
 
 - Branch: `main`, pushed to https://github.com/hyukhogwon/eghs (public). HEAD at P2 completion: `e1371d7`.
-- Suite: **115/115** via `npm test`. Do NOT use `node --test tests/` (bare directory form) — broken on Node v24; single-file `node --test tests/<file>.js` works.
-- Both hooks are registered in `.claude/settings.json` and live in this repo's own Claude Code sessions (dogfooding: the `[EGHS] Working agreement` system reminder each turn is P2 working).
+- Suite: **200/200** via `npm test`. Do NOT use `node --test tests/` (bare directory form) — broken on Node v24; single-file `node --test tests/<file>.js` works.
+- All hooks (Stop, UserPromptSubmit, PreToolUse + PostToolUse with matcher `Read|Write|Edit|MultiEdit`) are registered in `.claude/settings.json` and live in this repo's own Claude Code sessions (dogfooding).
 
 ## Process Conventions (established across P1/P2, keep for P3)
 
@@ -35,12 +35,22 @@ Evidence-Gated Hook System for Claude Code. Rollout per PRD §6:
 - **verify.js timeout design is deliberate**: manual timer + detached process-group SIGTERM→SIGKILL (hooks/lib/verify.js). Do NOT "simplify" to child_process's built-in `timeout` option — it signals only the direct child and leaks grandchildren.
 - No `CLAUDE_CODE_PID` env var exists in Claude Code (verified v2.1.198); lease/lock pid is `process.ppid` by design. NO_SESSION fail-open path logs `[eghs] NO_SESSION` to stderr for observability (docs only guarantee session_id is a string, not UUIDv4).
 
-## Carried Items for P3 (from final P2 review, adjudicated)
+## P3 Design Decisions (do not re-litigate)
 
-1. **Extract shared `readStdin`** — currently duplicated byte-for-byte in `hooks/stop.js` and `hooks/user-prompt-submit.js` (plan-mandated deferral until a third consumer exists = P3). Fix the `EAGAIN → continue` busy-loop during extraction; update all three call sites together.
-2. **Schema MISMATCH handling** — `readSchemaVersion` returns `ok` for any well-formed version; no hook compares against `HOOK_SCHEMA_VERSION`. Bundle the PRD §R6 migrate-guidance rows with whichever phase lands `eghs-migrate`.
-3. **Zero-commit git repo edge (P1/Stop)** — fresh repo with no commits → `git diff HEAD` fails → confusing `INFRA_NOT_READY`. Known limitation, fix opportunistically.
-4. Minor: one test for `CLAUDE_PROJECT_DIR` unset → cwd fallback; tests leave `mkdtemp` dirs (OS-reaped, matches suite convention).
+- **P3 includes PreToolUse record-only hooks** (not just PostToolUse): the R4 write matrix consumes `pre/<sid>/<hash>.write.json`; without PreToolUse, R4 would sit permanently in its miss-path. Plan: `docs/superpowers/plans/2026-07-02-eghs-p3-state-writer.md`.
+- **Both tool hooks ALWAYS exit 0** — exit 2 on PreToolUse would deny the tool call; every abnormal path degrades to "skip recording". Denies are P4.
+- Canonical key = realpath + lowercase iff caseless FS (`fs-info.json`, probed once by init via `.cs-probe`/`.CS-PROBE` dev+ino compare). New-file Writes use deep-new-path resolution (`canonicalKeyAllowMissing`). Out-of-repo keys skip.
+- SHA-256 is streamed (64KiB chunks) — `readFileSync` whole-file breaks at 2GiB.
+- Evidence grades: `full_read`, `partial_read` (offset/limit or > `max_full_read_bytes`, sha null — must never pass a gate), `stale_read` (PreToolUse sha mismatch = TOCTOU), `post_edit_success`, `post_edit_partial`.
+- Failed markers: key-scoped `failed/<hash>.json` + sid-scoped `failed/<sid>/<hash>.json`. Clear policy (PRD 170): own-sid always; other-sid key-scoped only if `ts_ms < lease start_ms`; other-sid sid-scoped NEVER (cascade GC's job).
+- Orphan pre-file 2nd pass: a sid is dead only on lease ENOENT or dead pid; a present-but-corrupt lease is LIVE (fail-closed); lease re-checked immediately before the unlink.
+- Lease pid = `process.ppid` (see CLAUDE_CODE_PID note above); lease failure in a tool hook → sid-scoped `lease_unavailable` marker, skip.
+
+## Carried Items for P4 (adjudicated)
+
+1. **Schema MISMATCH handling** — `readSchemaVersion` returns `ok` for any well-formed version; no hook compares against `HOOK_SCHEMA_VERSION`. Bundle the PRD §R6 migrate-guidance rows with whichever phase lands `eghs-migrate`.
+2. **Zero-commit git repo edge (P1/Stop)** — fresh repo with no commits → `git diff HEAD` fails → confusing `INFRA_NOT_READY`. Known limitation, fix opportunistically.
+3. Minor: one test for `CLAUDE_PROJECT_DIR` unset → cwd fallback; tests leave `mkdtemp` dirs (OS-reaped, matches suite convention).
 
 ## Deferred: Codex CLI Port (comes AFTER P4)
 
@@ -51,20 +61,21 @@ hooks.json subsystem (same events/exit-2-stderr contract), so the port is mostly
 registration (`.codex/hooks.json`, trust-gated) plus small payload/env deltas. Re-verify
 against the then-installed Codex version before designing.
 
-## P3 Pointers
+## P4 Pointers
 
-- Spec: PRD §R2 (Read state recording, lines 88-173), §R2.5 (state dir layout — `reads/`, `failed/`, `pre/` subdirs deferred from P1), §R4 (Edit state update). P3 is "gate off, state 기록만" — no denies yet.
-- P3 needs: `fs-info.json` case-sensitivity probe in `eghs-init` (PRD R2 lines 110-115), canonical path (realpath + optional lowercase), SHA-256 of raw disk bytes, `PostToolUse` matchers for Read and Write/Edit.
-- Exit criteria: "state 생성/갱신 정상" — an `eghs-inspect` dump CLI is named as the P3 verification tool (PRD §6 line 761).
-- Reuse: `atomic-write`, `exclusive-link`, `state-dir`, `schema`, `kill-switch`, `ci` libs as-is; extend `P1_SUBDIRS` (rename or add a P3 list).
+- Spec: PRD §R3 (Edit gate — evidence check + deny codes, lines ~300-430), §R4 deny rows, §6 P4 exit criteria (evidence-bearing Edit ratio > 0.9, zero perceived false-denies).
+- P4 flips PreToolUse Write/Edit from record-only to gating: `full_read`/`post_edit_success` evidence with matching sha passes; `failed/<current_sid>/` markers deny. Scope: core source paths only (matcher/config).
+- The R3 gate reads exactly what `node hooks/inspect.js --dry-run` prints today (state record, key marker, sid marker, pre-files) — inspect is the gate's preview.
+- NFC/NFD Unicode normalization spec gap (PRD says `lowercase(realpath)` only) — decision deferred at P3 finale; revisit before P4 widens matchers.
 
 ## Verification Quick Reference
 
 ```bash
-npm test                                   # full suite, expect 113 passing
+npm test                                   # full suite, expect 200 passing
 printf '{"session_id":"11111111-1111-4111-8111-111111111111"}' \
   | node hooks/stop.js; echo " exit=$?"    # Stop smoke (this repo: exit 0, EMPTY stdout when clean)
 printf '{}' | node hooks/user-prompt-submit.js; echo " exit=$?"  # UPS smoke: principles JSON + exit 0
+node hooks/inspect.js                      # P3 state dump (schema/fs-info/sessions/reads/markers/pre)
 ```
 
 Kill switch for local debugging: `touch .claude/eghs-off` (remove after) or `EGHS_DISABLED=1`.
