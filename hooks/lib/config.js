@@ -11,6 +11,7 @@ const DEFAULT_CONFIG = Object.freeze({
   verification_env: {},
   skip_if_only_changed: [],
   diff_base: 'session_baseline',
+  max_full_read_bytes: 5 * 1024 * 1024, // above this a Read records partial_read (PRD §R2)
   matcher_engine: 'picomatch',
   debug: true,
 });
