@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 'use strict';
 const fs = require('fs');
+const path = require('path');
 const { readStdin } = require('./lib/stdin');
 const { resolveToolHookContext, isOutsideRepo } = require('./lib/tool-hook');
 const { loadConfig } = require('./lib/config');
-const { canonicalKey, canonicalKeyAllowMissing, sha256File } = require('./lib/canonical');
+const { canonicalKey, canonicalKeyAllowMissing, keyHash, sha256File } = require('./lib/canonical');
+const { isAlive } = require('./lib/proc');
 const { writeReadState, writeFailedMarker, clearMarkersOnSuccess } = require('./lib/read-state');
 const { readPreFile, deletePreFile, gcPreFiles } = require('./lib/pre-file');
 const { ensureSessionLease } = require('./lib/session');
@@ -120,6 +122,172 @@ function handleRead(ctx, input, config, lease, nowMs) {
   });
 }
 
+// R4 2nd-pass pre-file search (PRD lines 443-453), P3-simplified: when this
+// sid has no pre-record, look for orphaned write pre-files left by dead
+// sessions (crashed before their PostToolUse). Live-lease sids are never
+// touched. Deviation from the PRD's full fstat/re-stat TOCTOU dance is
+// deliberate for record-only P3 — the worst case is a lost dead-sid marker,
+// which cannot affect any gate decision.
+// A sid is dead only when its lease is provably absent (ENOENT) or names a
+// dead pid. A present-but-unreadable/unparseable lease is treated as LIVE
+// (fail-closed): unlinking a live session's pre-file would poison its own
+// PostToolUse pass.
+function leaseIsDead(stateDir, sid) {
+  let raw;
+  try {
+    raw = fs.readFileSync(path.join(stateDir, 'sessions', `${sid}.json`), 'utf8');
+  } catch (err) {
+    return err.code === 'ENOENT';
+  }
+  try {
+    return !isAlive(JSON.parse(raw).pid);
+  } catch {
+    return false;
+  }
+}
+
+function handleMissingPre(ctx, key, nowMs) {
+  const preRoot = path.join(ctx.stateDir, 'pre');
+  const orphanName = `${keyHash(key)}.write.json`;
+  let sids = [];
+  try {
+    sids = fs.readdirSync(preRoot);
+  } catch {
+    // pre/ unreadable: fall through to the current-sid marker below.
+  }
+  let orphanFound = false;
+  for (const otherSid of sids) {
+    if (otherSid === ctx.sid || otherSid === 'tmp') continue;
+    const orphanPath = path.join(preRoot, otherSid, orphanName);
+    if (!fs.existsSync(orphanPath)) continue;
+    if (!leaseIsDead(ctx.stateDir, otherSid)) continue; // 활성 lease 보호: never touch a live session
+    orphanFound = true;
+    // Marker lands under the DEAD sid (origin preserved): it can never block
+    // the current session, only document the dead one's unfinished edit.
+    writeFailedMarker(ctx.stateDir, key, {
+      sid: otherSid,
+      tsMs: nowMs,
+      reason: 'state_record_failed',
+      sidScoped: true,
+    });
+    // Re-verify right before the destructive step (PRD R4 line 451): the sid
+    // may have been revived since the check above. If so, leave the pre-file
+    // for the revived session's own PostToolUse to consume.
+    if (!leaseIsDead(ctx.stateDir, otherSid)) continue;
+    try {
+      fs.unlinkSync(orphanPath);
+    } catch {
+      // raced with GC: fine
+    }
+  }
+  if (!orphanFound) {
+    // PreToolUse never ran (or was GC'd): the root cause is this sid's own
+    // record chain, so the marker is scoped to it (PRD R4 step 5).
+    writeFailedMarker(ctx.stateDir, key, {
+      sid: ctx.sid,
+      tsMs: nowMs,
+      reason: 'state_record_failed',
+      sidScoped: true,
+    });
+  }
+}
+
+// R4 processing matrix (PRD lines 457-468) — gate off, records only.
+function handleWrite(ctx, input, lease, nowMs) {
+  const resolved = canonicalKeyAllowMissing(input.tool_input.file_path, { caseless: ctx.caseless });
+  if (!resolved.ok) {
+    skipLog(ctx, input, nowMs, 'FILE_UNREADABLE');
+    return;
+  }
+  const key = resolved.key;
+  if (isOutsideRepo(key, ctx.repoRoot, ctx.caseless)) {
+    skipLog(ctx, input, nowMs, null);
+    return;
+  }
+
+  // post_sha: disk truth after the tool ran; null = file absent (PRD R4).
+  // Exists-but-unreadable is NOT null — treating it as a clean absence would
+  // swallow a real disk change, so it skips instead.
+  const post = sha256File(key);
+  if (!post.ok && !post.missing) {
+    skipLog(ctx, input, nowMs, 'FILE_UNREADABLE');
+    return;
+  }
+  const postSha = post.ok ? post.sha : null;
+
+  const pre = readPreFile(ctx.stateDir, ctx.sid, key, 'write');
+  if (pre !== null && pre.pretool_sid !== ctx.sid) {
+    // MVP #17: pretool_sid/posttool_sid invariant broken — poisoned record.
+    // Marker BEFORE deleting the pre-file: if the marker write fails, the
+    // pre-file must survive as the only remaining trace of the poisoning.
+    writeFailedMarker(ctx.stateDir, key, { sid: ctx.sid, tsMs: nowMs, reason: 'state_record_failed', sidScoped: true });
+    deletePreFile(ctx.stateDir, ctx.sid, key, 'write');
+    skipLog(ctx, input, nowMs, 'STATE_RECORD_FAILED');
+    return;
+  }
+  if (pre === null) {
+    handleMissingPre(ctx, key, nowMs);
+    skipLog(ctx, input, nowMs, 'STATE_RECORD_FAILED');
+    return;
+  }
+  const preSha = typeof pre.pre_sha === 'string' ? pre.pre_sha : null;
+
+  const toolError = !!(input.tool_response && input.tool_response.error);
+  const changed = postSha !== preSha;
+
+  let evidence = null; // null → keep existing state untouched
+  let markerReason = null;
+  let warn = null;
+  if (!toolError) {
+    if (preSha === null && postSha !== null) evidence = 'post_edit_success'; // new file success (best-effort)
+    else if (preSha === null && postSha === null) {
+      markerReason = 'state_record_failed'; // unexpected: Write "succeeded" but nothing on disk
+      warn = 'edit reported success but the file does not exist';
+    } else if (changed) evidence = 'post_edit_success'; // edit success
+    // else: no-op edit → state 유지
+  } else {
+    if (preSha === null && postSha !== null) {
+      evidence = 'post_edit_partial';
+      markerReason = 'overwrite_race'; // errored new-file Write left bytes behind
+    } else if (preSha !== null && changed) {
+      evidence = 'post_edit_partial';
+      markerReason = 'post_edit_partial'; // partial apply
+    }
+    // else: clean failure → 변경 없음, state 유지
+  }
+
+  let recordFailed = false;
+  if (evidence !== null) {
+    const wrote = writeReadState(ctx.stateDir, key, {
+      file: key,
+      sha: postSha,
+      size: post.ok ? post.size : 0,
+      ts_ms: nowMs,
+      sid: ctx.sid,
+      evidence,
+    });
+    recordFailed = !wrote.ok;
+  }
+  if (recordFailed) {
+    writeFailedMarker(ctx.stateDir, key, { sid: ctx.sid, tsMs: nowMs, reason: 'state_record_failed' });
+  } else if (markerReason !== null) {
+    writeFailedMarker(ctx.stateDir, key, { sid: ctx.sid, tsMs: nowMs, reason: markerReason });
+  } else if (evidence === 'post_edit_success') {
+    clearMarkersOnSuccess(ctx.stateDir, key, { sid: ctx.sid, leaseStartMs: lease.start_ms });
+  }
+  if (warn) process.stderr.write(`[eghs] post-tool-use: ${warn}: ${key}\n`);
+
+  deletePreFile(ctx.stateDir, ctx.sid, key, 'write'); // PRD R4: consumed last
+  appendDebugLog(ctx.stateDir, ctx.sid, {
+    ts_ms: nowMs,
+    hook: 'PostToolUse',
+    tool: input.tool_name,
+    decision: evidence || markerReason ? 'record' : 'skip',
+    deny_code: recordFailed || markerReason ? 'STATE_RECORD_FAILED' : null,
+    evidence,
+  });
+}
+
 function main() {
   let input;
   try {
@@ -181,8 +349,9 @@ function main() {
 
   if (isRead) {
     handleRead(ctx, input, config, lease, nowMs);
+  } else {
+    handleWrite(ctx, input, lease, nowMs);
   }
-  // Write|Edit|MultiEdit: R4 matrix lands in the next unit.
 }
 
 try {
