@@ -40,7 +40,7 @@ function writeReadState(stateDir, key, record) {
 function readReadState(stateDir, key) {
   try {
     const state = JSON.parse(fs.readFileSync(readsPath(stateDir, key), 'utf8'));
-    return state !== null && typeof state === 'object' ? state : null;
+    return state !== null && typeof state === 'object' && !Array.isArray(state) ? state : null;
   } catch {
     return null;
   }
@@ -50,6 +50,9 @@ function readReadState(stateDir, key) {
 // sidScoped markers affect only their own session and are cascade-GC'd with
 // it; key-scoped markers block every session (P4). Best-effort by contract.
 function writeFailedMarker(stateDir, key, { sid, tsMs, reason, sidScoped = false }) {
+  // A sidScoped request with a non-string sid must not alias into the
+  // key-scoped path (markerPath treats null as "key-scoped" by design).
+  if (sidScoped && typeof sid !== 'string') return;
   const body = { schema_version: 1, origin_sid: sid, ts_ms: tsMs, reason };
   try {
     // atomicWriteFile's tmp helper mkdirs the destination's tmp/ subdir
@@ -65,15 +68,21 @@ function writeFailedMarker(stateDir, key, { sid, tsMs, reason, sidScoped = false
 // (b) the key-scoped marker iff we own it OR it predates our lease start
 // (a newer marker belongs to a concurrently-active session — keep it).
 function clearMarkersOnSuccess(stateDir, key, { sid, leaseStartMs }) {
-  try {
-    fs.unlinkSync(markerPath(stateDir, key, sid));
-  } catch {
-    // ENOENT/EPERM: best-effort, retried on the next successful record.
+  if (typeof sid === 'string') {
+    // Non-string sid would alias markerPath into the key-scoped file and
+    // bypass the release policy below — skip the own-marker unlink instead.
+    try {
+      fs.unlinkSync(markerPath(stateDir, key, sid));
+    } catch {
+      // ENOENT/EPERM: best-effort, retried on the next successful record.
+    }
   }
   try {
     const keyScoped = markerPath(stateDir, key, null);
     const marker = JSON.parse(fs.readFileSync(keyScoped, 'utf8'));
-    if (marker.origin_sid === sid || marker.ts_ms < leaseStartMs) {
+    // ts_ms must be a real number: a corrupt marker (ts_ms null/string)
+    // coercing past `<` would fail-open and clear a foreign marker.
+    if (marker.origin_sid === sid || (typeof marker.ts_ms === 'number' && marker.ts_ms < leaseStartMs)) {
       fs.unlinkSync(keyScoped);
     }
   } catch {

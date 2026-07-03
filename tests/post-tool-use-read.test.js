@@ -96,7 +96,19 @@ test('a file above max_full_read_bytes records partial_read even without offset/
   const file = path.join(repo, 'big.txt');
   fs.writeFileSync(file, 'way more than four bytes');
   runHook(POST_HOOK, repo, readInput(file));
-  assert.equal(readState(repo, file).evidence, 'partial_read');
+  const state = readState(repo, file);
+  assert.equal(state.evidence, 'partial_read');
+  assert.equal(state.sha, null); // partial evidence must never carry a gate-passing sha
+});
+
+test('offset:0 still records partial_read (explicit offset, not truthiness)', () => {
+  const repo = mkRepo();
+  const file = path.join(repo, 'z.txt');
+  fs.writeFileSync(file, '0123456789');
+  runHook(POST_HOOK, repo, readInput(file, { offset: 0 }));
+  const state = readState(repo, file);
+  assert.equal(state.evidence, 'partial_read');
+  assert.equal(state.sha, null);
 });
 
 test('TOCTOU: a pre-read sha mismatch records stale_read and leaves a key-scoped marker', () => {
@@ -145,11 +157,15 @@ test('a PostToolUse Read also creates/renews the session lease', () => {
   const repo = mkRepo();
   const file = path.join(repo, 'l.txt');
   fs.writeFileSync(file, 'x');
+  const leasePath = path.join(repo, '.claude', 'state', 'eghs', 'sessions', `${SID}.json`);
   runHook(POST_HOOK, repo, readInput(file));
-  const lease = JSON.parse(
-    fs.readFileSync(path.join(repo, '.claude', 'state', 'eghs', 'sessions', `${SID}.json`), 'utf8')
-  );
-  assert.equal(typeof lease.start_ms, 'number');
+  const first = JSON.parse(fs.readFileSync(leasePath, 'utf8'));
+  assert.equal(typeof first.start_ms, 'number');
+  assert.equal(first.pid, process.pid); // hook's ppid = this test process
+  runHook(POST_HOOK, repo, readInput(file));
+  const second = JSON.parse(fs.readFileSync(leasePath, 'utf8'));
+  assert.equal(second.start_ms, first.start_ms); // renewal preserves lease start
+  assert.ok(second.renewed_ms >= first.renewed_ms);
 });
 
 test('guards: kill switch, CI, NO_SESSION, uninitialized state all skip with exit 0', () => {

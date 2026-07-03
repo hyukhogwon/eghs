@@ -34,6 +34,44 @@ test('canonicalKey lowercases the resolved path only on a caseless fs', () => {
   assert.deepEqual(canonicalKey(file, { caseless: false }), { ok: true, key: resolved });
 });
 
+test('canonicalKey NFC-normalizes before lowercasing on a caseless fs', () => {
+  const dir = mkDir();
+  const nfdName = 'cafe\u0301-\u1100\u1161.txt'; // NFD é + decomposed 가
+  const nfcName = 'caf\u00e9-\uAC00.txt'; // same name in NFC
+  const file = path.join(dir, nfdName);
+  fs.writeFileSync(file, 'x');
+  const r = canonicalKey(file, { caseless: true });
+  assert.equal(r.ok, true);
+  assert.ok(r.key.endsWith(nfcName), `key not NFC: ${JSON.stringify(r.key)}`);
+  // NFC and NFD spellings of the same name must collapse to one key.
+  const r2 = canonicalKey(path.join(dir, nfcName), { caseless: true });
+  if (r2.ok) assert.equal(r2.key, r.key); // normalization-insensitive FS resolves both; else skip
+});
+
+test('canonicalKey without an opts argument does not throw (programmer-error hardening)', () => {
+  const dir = mkDir();
+  const file = path.join(dir, 'NoOpts.txt');
+  fs.writeFileSync(file, 'x');
+  const r = canonicalKey(file);
+  assert.equal(r.ok, true);
+  assert.equal(r.key, fs.realpathSync(file)); // no caseless flag → no lowercase
+});
+
+test('canonicalKey classifies an EACCES-blocked path as unreadable but NOT missing', (t) => {
+  if (process.getuid() === 0) return t.skip('root bypasses file modes');
+  const dir = mkDir();
+  const sub = path.join(dir, 'locked');
+  fs.mkdirSync(sub);
+  fs.writeFileSync(path.join(sub, 'f.txt'), 'x');
+  fs.chmodSync(sub, 0o000);
+  try {
+    const r = canonicalKey(path.join(sub, 'f.txt'), { caseless: false });
+    assert.deepEqual(r, { ok: false, code: 'FILE_UNREADABLE', missing: false });
+  } finally {
+    fs.chmodSync(sub, 0o700);
+  }
+});
+
 test('canonicalKey classifies a missing path as FILE_UNREADABLE with missing:true', () => {
   const dir = mkDir();
   const r = canonicalKey(path.join(dir, 'nope.txt'), { caseless: false });

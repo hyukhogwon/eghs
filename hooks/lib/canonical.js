@@ -3,28 +3,36 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
+// Caseless canonical form (PRD §R2, amended 2026-07-03): NFC-normalize
+// before lowercasing so NFD/NFC spellings of the same file (Korean 자소분리,
+// café on APFS) can't split into two keys.
+function caselessKey(resolved) {
+  return resolved.normalize('NFC').toLowerCase();
+}
+
 // Canonical key (PRD §R2): realpath resolves symlinks and ./.. segments,
-// then lowercase iff the state dir's fs-info cache says the filesystem is
-// caseless (macOS APFS default, NTFS). Failures classify as FILE_UNREADABLE
-// rather than throwing — the P3 hooks are record-only and must degrade to
-// "skip", never crash. `missing` distinguishes ENOENT (file absent — R4
-// needs post_sha=null, R3 allows new-file Write) from EACCES-class errors
-// (file present but unreadable — must NOT be treated as a clean absence).
-function canonicalKey(filePath, { caseless }) {
+// then lowercase(NFC(...)) iff the state dir's fs-info cache says the
+// filesystem is caseless (macOS APFS default, NTFS). Failures classify as
+// FILE_UNREADABLE rather than throwing — the P3 hooks are record-only and
+// must degrade to "skip", never crash. `missing` distinguishes ENOENT (file
+// absent — R4 needs post_sha=null, R3 allows new-file Write) from
+// EACCES-class errors (file present but unreadable — must NOT be treated as
+// a clean absence).
+function canonicalKey(filePath, { caseless } = {}) {
   let resolved;
   try {
     resolved = fs.realpathSync(filePath);
   } catch (err) {
     return { ok: false, code: 'FILE_UNREADABLE', missing: err.code === 'ENOENT' };
   }
-  return { ok: true, key: caseless ? resolved.toLowerCase() : resolved };
+  return { ok: true, key: caseless ? caselessKey(resolved) : resolved };
 }
 
 // Deep-new-path canonical key (PRD §R3): when the file does not exist yet
 // (new Write intent), walk up to the first existing ancestor, realpath it,
 // and re-append the not-yet-existing segments. `missing: true` on the ok
 // result tells the caller to record pre_sha: null.
-function canonicalKeyAllowMissing(filePath, { caseless }) {
+function canonicalKeyAllowMissing(filePath, { caseless } = {}) {
   const direct = canonicalKey(filePath, { caseless });
   if (direct.ok) return { ...direct, missing: false };
   if (!direct.missing) return direct; // EACCES-class: not a new-file case
@@ -45,7 +53,7 @@ function canonicalKeyAllowMissing(filePath, { caseless }) {
       return { ok: false, code: 'FILE_UNREADABLE', missing: false };
     }
     const key = path.join(real, ...pending);
-    return { ok: true, key: caseless ? key.toLowerCase() : key, missing: true };
+    return { ok: true, key: caseless ? caselessKey(key) : key, missing: true };
   }
 }
 

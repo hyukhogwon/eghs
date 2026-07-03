@@ -283,7 +283,9 @@ function handleWrite(ctx, input, lease, nowMs) {
     hook: 'PostToolUse',
     tool: input.tool_name,
     decision: evidence || markerReason ? 'record' : 'skip',
-    deny_code: recordFailed || markerReason ? 'STATE_RECORD_FAILED' : null,
+    // STATE_RECORD_FAILED only when no evidence landed — matrix rows that
+    // record post_edit_partial alongside their marker are not record failures.
+    deny_code: recordFailed || markerReason === 'state_record_failed' ? 'STATE_RECORD_FAILED' : null,
     evidence,
   });
 }

@@ -32,6 +32,35 @@ test('readStdin drains input larger than one 64KiB buffer', () => {
   assert.equal(out, `${big.length}:${'x'.repeat(32)}:${'x'.repeat(29)}END`);
 });
 
+// Error-injection paths: readStdin reads fd 0 via fs.readSync, so stubbing
+// fs.readSync in-process exercises the non-EAGAIN branches deterministically.
+test('readStdin rethrows non-EAGAIN readSync errors and stops on the EOF code', () => {
+  const fs = require('fs');
+  const { readStdin } = require(LIB);
+  const real = fs.readSync;
+  try {
+    fs.readSync = () => {
+      const e = new Error('input/output error');
+      e.code = 'EIO';
+      throw e;
+    };
+    assert.throws(() => readStdin(), /input\/output error/);
+    let calls = 0;
+    fs.readSync = (fd, buf) => {
+      if (calls++ === 0) {
+        buf.write('partial');
+        return 7;
+      }
+      const e = new Error('end');
+      e.code = 'EOF';
+      throw e;
+    };
+    assert.equal(readStdin(), 'partial');
+  } finally {
+    fs.readSync = real;
+  }
+});
+
 // Pins the EAGAIN retry path — the one behavioral change vs the pre-extraction
 // code. Touching process.stdin flips fd 0 to O_NONBLOCK, so readSync hits
 // EAGAIN until the parent writes 150ms later. The CPU bound distinguishes the

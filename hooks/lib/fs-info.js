@@ -16,7 +16,12 @@ function readFsInfo(stateDir) {
     return err.code === 'ENOENT' ? { status: 'missing' } : { status: 'invalid' };
   }
   // `null` is valid JSON — the property access below would throw on it.
-  if (info === null || typeof info !== 'object' || typeof info.caseless_fs !== 'boolean') {
+  if (
+    info === null ||
+    typeof info !== 'object' ||
+    info.schema_version !== 1 ||
+    typeof info.caseless_fs !== 'boolean'
+  ) {
     return { status: 'invalid' };
   }
   return { status: 'ok', caseless: info.caseless_fs };
@@ -29,9 +34,10 @@ function probeAndWriteFsInfo(stateDir, nowMs) {
   const lower = path.join(stateDir, '.cs-probe');
   const upper = path.join(stateDir, '.CS-PROBE');
   // Leftovers from a crashed probe would EEXIST the create (caseless FS) —
-  // clear both spellings first.
-  fs.rmSync(lower, { force: true });
-  fs.rmSync(upper, { force: true });
+  // clear both spellings first. recursive handles a probe-named *directory*
+  // (external tampering) that plain rm would EISDIR-crash-loop on.
+  fs.rmSync(lower, { force: true, recursive: true });
+  fs.rmSync(upper, { force: true, recursive: true });
   fs.closeSync(fs.openSync(lower, 'wx', 0o600));
   let caseless = false;
   try {
@@ -43,8 +49,8 @@ function probeAndWriteFsInfo(stateDir, nowMs) {
       if (err.code !== 'ENOENT') throw err;
     }
   } finally {
-    fs.rmSync(lower, { force: true });
-    fs.rmSync(upper, { force: true });
+    fs.rmSync(lower, { force: true, recursive: true });
+    fs.rmSync(upper, { force: true, recursive: true });
   }
   atomicWriteFile(
     path.join(stateDir, FS_INFO_FILENAME),

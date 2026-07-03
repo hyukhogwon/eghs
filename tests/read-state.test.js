@@ -161,3 +161,48 @@ test("clearMarkersOnSuccess does not touch another sid's sid-scoped marker", () 
   clearMarkersOnSuccess(stateDir, KEY, { sid: SID_A, leaseStartMs: 1000 });
   assert.ok(fs.existsSync(path.join(stateDir, 'failed', SID_B, `${keyHash(KEY)}.json`)));
 });
+
+test('readReadState returns null for a JSON-array record (schema-shaped objects only)', () => {
+  const stateDir = mkStateDir();
+  fs.writeFileSync(path.join(stateDir, 'reads', `${keyHash(KEY)}.json`), '[1,2,3]');
+  assert.equal(readReadState(stateDir, KEY), null);
+});
+
+test('writeFailedMarker sidScoped with a null sid writes nothing (no key-scoped aliasing)', () => {
+  const stateDir = mkStateDir();
+  writeFailedMarker(stateDir, KEY, { sid: null, tsMs: 1, reason: 'stale_read', sidScoped: true });
+  assert.ok(!fs.existsSync(path.join(stateDir, 'failed', `${keyHash(KEY)}.json`)));
+});
+
+test("clearMarkersOnSuccess with a null sid cannot alias into the key-scoped marker", () => {
+  const stateDir = mkStateDir();
+  writeFailedMarker(stateDir, KEY, { sid: SID_B, tsMs: 2000, reason: 'overwrite_race' });
+  clearMarkersOnSuccess(stateDir, KEY, { sid: null, leaseStartMs: 1000 });
+  assert.ok(fs.existsSync(path.join(stateDir, 'failed', `${keyHash(KEY)}.json`)));
+});
+
+test('clearMarkersOnSuccess keeps a foreign marker whose ts_ms is corrupt (null) — fail-closed', () => {
+  const stateDir = mkStateDir();
+  const p = path.join(stateDir, 'failed', `${keyHash(KEY)}.json`);
+  fs.writeFileSync(
+    p,
+    JSON.stringify({ schema_version: 1, origin_sid: SID_B, ts_ms: null, reason: 'stale_read' })
+  );
+  clearMarkersOnSuccess(stateDir, KEY, { sid: SID_A, leaseStartMs: 1000 });
+  assert.ok(fs.existsSync(p));
+});
+
+test('clearMarkersOnSuccess keeps a foreign marker at exactly leaseStartMs (strict <)', () => {
+  const stateDir = mkStateDir();
+  writeFailedMarker(stateDir, KEY, { sid: SID_B, tsMs: 1000, reason: 'overwrite_race' });
+  clearMarkersOnSuccess(stateDir, KEY, { sid: SID_A, leaseStartMs: 1000 });
+  assert.ok(fs.existsSync(path.join(stateDir, 'failed', `${keyHash(KEY)}.json`)));
+});
+
+test('a path-traversal sid cannot unlink outside failed/ on the CLEAR path', () => {
+  const stateDir = mkStateDir();
+  const outside = path.join(stateDir, `${keyHash(KEY)}.json`); // parent of failed/
+  fs.writeFileSync(outside, 'do-not-unlink');
+  clearMarkersOnSuccess(stateDir, KEY, { sid: '..', leaseStartMs: 1 });
+  assert.ok(fs.existsSync(outside));
+});

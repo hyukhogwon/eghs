@@ -8,8 +8,9 @@ const fs = require('fs');
 // spawn hooks that way); retrying immediately would spin a CPU core until the
 // writer catches up, so block this thread ~5ms per miss instead. Atomics.wait
 // is the only sync sleep available without a child process.
+const SLEEP_CELL = new Int32Array(new SharedArrayBuffer(4)); // reused across misses
 function sleepMs(ms) {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  Atomics.wait(SLEEP_CELL, 0, 0, ms);
 }
 
 function readStdin() {

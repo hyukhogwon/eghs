@@ -10,11 +10,11 @@ Evidence-Gated Hook System for Claude Code. Rollout per PRD §6:
 |-------|-------|--------|
 | P1 | Stop hook — typecheck/lint/test verification gate | **DONE** (reviewed, 96 tests) |
 | P2 | UserPromptSubmit — fail-soft prompt-discipline injection | **DONE** (reviewed, +17 tests) |
-| P3 | Pre/PostToolUse Read/Edit state writer — gate off, records only | **DONE** (reviewed per unit, +85 tests) |
+| P3 | Pre/PostToolUse Read/Edit state writer — gate off, records only | **DONE** (reviewed per unit, +102 tests) |
 | P4 | Edit state-gate on core source paths | NOT STARTED |
 
 - Branch: `main`, pushed to https://github.com/hyukhogwon/eghs (public). HEAD at P2 completion: `e1371d7`.
-- Suite: **200/200** via `npm test`. Do NOT use `node --test tests/` (bare directory form) — broken on Node v24; single-file `node --test tests/<file>.js` works.
+- Suite: **217/217** via `npm test`. Do NOT use `node --test tests/` (bare directory form) — broken on Node v24; single-file `node --test tests/<file>.js` works.
 - All hooks (Stop, UserPromptSubmit, PreToolUse + PostToolUse with matcher `Read|Write|Edit|MultiEdit`) are registered in `.claude/settings.json` and live in this repo's own Claude Code sessions (dogfooding).
 
 ## Process Conventions (established across P1/P2, keep for P3)
@@ -39,7 +39,7 @@ Evidence-Gated Hook System for Claude Code. Rollout per PRD §6:
 
 - **P3 includes PreToolUse record-only hooks** (not just PostToolUse): the R4 write matrix consumes `pre/<sid>/<hash>.write.json`; without PreToolUse, R4 would sit permanently in its miss-path. Plan: `docs/superpowers/plans/2026-07-02-eghs-p3-state-writer.md`.
 - **Both tool hooks ALWAYS exit 0** — exit 2 on PreToolUse would deny the tool call; every abnormal path degrades to "skip recording". Denies are P4.
-- Canonical key = realpath + lowercase iff caseless FS (`fs-info.json`, probed once by init via `.cs-probe`/`.CS-PROBE` dev+ino compare). New-file Writes use deep-new-path resolution (`canonicalKeyAllowMissing`). Out-of-repo keys skip.
+- Canonical key = realpath, then `lowercase(NFC(...))` iff caseless FS (`fs-info.json`, probed once by init via `.cs-probe`/`.CS-PROBE` dev+ino compare; NFC amendment 2026-07-03). New-file Writes use deep-new-path resolution (`canonicalKeyAllowMissing`). Out-of-repo keys skip.
 - SHA-256 is streamed (64KiB chunks) — `readFileSync` whole-file breaks at 2GiB.
 - Evidence grades: `full_read`, `partial_read` (offset/limit or > `max_full_read_bytes`, sha null — must never pass a gate), `stale_read` (PreToolUse sha mismatch = TOCTOU), `post_edit_success`, `post_edit_partial`.
 - Failed markers: key-scoped `failed/<hash>.json` + sid-scoped `failed/<sid>/<hash>.json`. Clear policy (PRD 170): own-sid always; other-sid key-scoped only if `ts_ms < lease start_ms`; other-sid sid-scoped NEVER (cascade GC's job).
@@ -66,12 +66,12 @@ against the then-installed Codex version before designing.
 - Spec: PRD §R3 (Edit gate — evidence check + deny codes, lines ~300-430), §R4 deny rows, §6 P4 exit criteria (evidence-bearing Edit ratio > 0.9, zero perceived false-denies).
 - P4 flips PreToolUse Write/Edit from record-only to gating: `full_read`/`post_edit_success` evidence with matching sha passes; `failed/<current_sid>/` markers deny. Scope: core source paths only (matcher/config).
 - The R3 gate reads exactly what `node hooks/inspect.js --dry-run` prints today (state record, key marker, sid marker, pre-files) — inspect is the gate's preview.
-- NFC/NFD Unicode normalization spec gap (PRD says `lowercase(realpath)` only) — decision deferred at P3 finale; revisit before P4 widens matchers.
+- NFC/NFD normalization DECIDED at P3 finale (2026-07-03): canonical key on caseless FS is `lowercase(NFC(realpath))` — PRD §R2 amended, implemented in `hooks/lib/canonical.js` (`caselessKey`).
 
 ## Verification Quick Reference
 
 ```bash
-npm test                                   # full suite, expect 200 passing
+npm test                                   # full suite, expect 217 passing
 printf '{"session_id":"11111111-1111-4111-8111-111111111111"}' \
   | node hooks/stop.js; echo " exit=$?"    # Stop smoke (this repo: exit 0, EMPTY stdout when clean)
 printf '{}' | node hooks/user-prompt-submit.js; echo " exit=$?"  # UPS smoke: principles JSON + exit 0

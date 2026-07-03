@@ -194,6 +194,28 @@ test("R4 orphan pre-file from a dead sid → dead sid's marker, orphan unlinked,
   assert.equal(readState(repo, file), null);
 });
 
+test('R4 orphan scan claims a pre-file whose lease names a DEAD pid', () => {
+  const repo = mkRepo();
+  const file = path.join(repo, 'deadpid.txt');
+  fs.writeFileSync(file, 'x');
+  const preDir = path.join(repo, '.claude', 'state', 'eghs', 'pre', DEAD_SID);
+  fs.mkdirSync(preDir, { recursive: true });
+  const orphan = path.join(preDir, `${keyHash(canonKey(repo, file))}.write.json`);
+  fs.writeFileSync(
+    orphan,
+    JSON.stringify({ schema_version: 1, pre_sha: null, pretool_sid: DEAD_SID })
+  );
+  // A freshly exited child's pid is provably dead (no reuse this fast).
+  const deadPid = spawnSync('node', ['-e', '']).pid;
+  fs.writeFileSync(
+    path.join(repo, '.claude', 'state', 'eghs', 'sessions', `${DEAD_SID}.json`),
+    JSON.stringify({ pid: deadPid, uid: process.getuid(), start_ms: 1, renewed_ms: 1 })
+  );
+  runHook(POST_HOOK, repo, editInput('PostToolUse', file));
+  assert.ok(!fs.existsSync(orphan));
+  assert.equal(marker(repo, file, DEAD_SID).origin_sid, DEAD_SID);
+});
+
 test('R4 orphan scan never touches a pre-file whose sid holds a LIVE lease', () => {
   const repo = mkRepo();
   const file = path.join(repo, 'live.txt');
