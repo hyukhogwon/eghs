@@ -106,12 +106,13 @@ State record (schema_version=1):
 **Canonical path 정의**:
 
 * `realpath(2)` 결과를 1차 정규화로 사용한다(symlink 해소, `.`/`..` 정규화).
-* 파일시스템 case-sensitivity 감지: 결과는 `.claude/state/eghs/fs-info.json`에 1회만 캐시한다(아래 절차). hook은 매 호출마다 cache 파일을 stat만 한다(쓰기 없음). caseless FS(macOS APFS 기본, Windows NTFS 등)면 canonical key는 `lowercase(NFC(realpath))` — Unicode NFC 정규화를 먼저 적용해 같은 파일의 NFD/NFC 표기(한글 자소분리, `café` 등)가 다른 key로 갈라지는 것을 막는다(2026-07-03 P3 finale 개정). 그 외는 `realpath` 그대로 사용한다.
-* cache 초기화 절차(installer/first-run helper가 수행, hook 내에서는 trigger만):
-    1. `eghs-init`은 시작 시 `.claude/state/eghs/.init.lock`을 `O_CREAT|O_EXCL`로 획득한다(advisory flock 보조). 이미 존재하면 hold하는 프로세스가 살아있는지 확인하고 살아있으면 즉시 종료(exit 0, "already initialized 또는 in progress" stderr).
-    2. `fs-info.json` 부재 시 `.cs-probe`/`.CS-PROBE` 파일을 atomic create 후 동일 inode 여부로 caseless 판정.
-    3. 결과를 `{ "schema_version": 1, "caseless_fs": bool, "ts_ms": ... }`로 atomic write.
-    4. probe 파일과 `.init.lock`을 즉시 삭제.
+* 파일시스템 case-sensitivity 감지: 결과는 `.claude/state/eghs/fs-info.json`에 1회만 캐시한다(아래 절차). hook은 매 호출마다 cache 파일을 `stat + read`한다(§R6 #3.3 flock_ok/FS anchor 검증 참조; 쓰기는 없음). caseless FS(macOS APFS 기본, Windows NTFS 등)면 canonical key는 `lowercase(NFC(realpath))` — Unicode NFC 정규화를 먼저 적용해 같은 파일의 NFD/NFC 표기(한글 자소분리, `café` 등)가 다른 key로 갈라지는 것을 막는다(2026-07-03 P3 finale 개정). 그 외는 `realpath` 그대로 사용한다.
+* cache 초기화 절차(installer/first-run helper가 수행, hook 내에서는 trigger만) — **canonical lock 순서**: `migrate.lock` → `.init.lock` (init/migrate mutex 규칙과 일치, 자세한 절차는 R2.5 `eghs-init` 참조):
+    1. `migrate.lock`을 `O_CREAT|O_EXCL`로 획득(role: "init"). init/migrate 간 mutex 단일 진실. 획득 실패 시 stale 회수 규칙(precedence #4)을 적용하고 안 되면 종료.
+    2. 역할 검증 후 `.claude/state/eghs/.init.lock`을 `O_CREAT|O_EXCL`로 획득(내부 단계 보호).
+    3. `fs-info.json` 부재 시 `.cs-probe`/`.CS-PROBE` 파일을 atomic create 후 동일 inode 여부로 caseless 판정.
+    4. 결과를 `{ "schema_version": 1, "caseless_fs": bool, "ts_ms": ..., "flock_ok": true, "fs_st_dev": <state root의 st_dev>, "fs_statfs_id": "<platform>:<value>" }`로 atomic write (R2.5 eghs-init step 6 flock probe 완료 후 최종 형태; 상세는 §R2.5 참조).
+    5. probe 파일 → `.init.lock` → `migrate.lock` 순서로 삭제. **모든 early-exit path(에러/시그널/재시도)에서 획득한 lock들을 역순으로 반드시 release**(`.init.lock`이 활성 `migrate.lock` 없이 잔존하는 상태 금지).
 * hook이 `fs-info.json` 부재 발견 시: 같은 sid의 PreToolUse는 `FS_INFO_MISSING` deny(infrastructure, auto-unblock=Yes, remediation: `eghs-init` 실행). 첫 install에 사용자 명시 부트스트랩을 요구해 hook 내 race를 회피.
 * `realpath` 실패 시(broken symlink, 권한 등) `FILE_UNREADABLE`로 처리한다.
 
@@ -129,7 +130,7 @@ State record (schema_version=1):
 **Read tool TOCTOU 처리**:
 
 * `PostToolUse Read` hook은 디스크에서 다시 SHA를 계산하므로, Read tool이 본 내용과 PostToolUse 시점 디스크 상태 사이에 race window가 존재한다.
-* PreToolUse Read hook도 SHA를 계산해 `pre/<sid>/<key>.read.json`에 임시 기록한다. PostToolUse Read는 이 값을 로드해 PostToolUse SHA와 비교한다.
+* PreToolUse Read hook도 SHA를 계산해 `pre/<sid>/<sha1(key)>.<tool_use_id>.read.json`에 임시 기록한다. PostToolUse Read는 이 값을 로드해 PostToolUse SHA와 비교한다.
 * PreToolUse Read의 pre-record가 없거나(설치 미완료/비활성) SHA 비교가 불가하면, PostToolUse SHA만 단일 소스로 기록하되 이 race를 v5 허용 risk로 둔다(Risks §7).
 * 비교 결과 mismatch면 `evidence: "stale_read"`로 기록하고 failed marker를 남긴다. `stale_read`는 R3 gate 통과 조건이 아니다.
 * PreToolUse Read의 임시 record는 PostToolUse Read가 처리 후 즉시 삭제한다.
@@ -160,7 +161,7 @@ State 기록 실패 시 failed marker를 남긴다. failed marker schema:
   "schema_version": 1,
   "origin_sid": "<sid-that-failed>",
   "ts_ms": 1780000000000,
-  "reason": "stale_read|state_record_failed|post_edit_partial|overwrite_race|migrate_in_progress|infra_not_ready|sid_collision|lease_unavailable|schema_invalid"
+  "reason": "stale_read|state_record_failed|post_edit_partial|overwrite_race|migrate_in_progress|infra_not_ready|sid_collision|lease_unavailable|schema_invalid|sid_cleared|migrate_lock_corrupt"
 }
 ```
 
@@ -192,7 +193,7 @@ State는 `.claude/state/eghs/` 아래 다음 구조로 저장한다.
 │   ├── <sid>/<sha1(canonical_key)>.json    # sid-scoped marker(자기 sid에만 영향, cascade GC)
 │   └── tmp/...
 ├── pre/
-│   └── <sid>/<sha1(canonical_key)>.{write|read}.json   # R3/R2 PreToolUse 임시
+│   └── <sid>/<sha1(canonical_key)>.<tool_use_id>.{write|read}.json   # R3/R2 PreToolUse 임시 (tool_use_id per-file 접미어 — 병렬 Read/Edit race 차단)
 ├── locks/
 │   └── stop-<sid>.lock       # Stop hook recursion lock (JSON: {pid, uid, start_ms, timeout_ms})
 ├── sessions/
@@ -218,11 +219,13 @@ State는 `.claude/state/eghs/` 아래 다음 구조로 저장한다.
     4. 상위 dir에 대해 `fsync(dirfd)`. 같은 파일시스템 내 cross-subdir rename이므로 상위 dir만 fsync로 충분(POSIX 권장).
     5. 같은 파일시스템 내 cross-subdir(`<dest_dir>/tmp/` → `<dest_dir>/`) atomic rename으로 보장된다.
 * `pre/<sid>/` 디렉토리:
-    * PreToolUse Write/Edit/MultiEdit은 `*.write.json`에 대상 파일 직전 SHA(`pre_sha`)와 PreToolUse sid(`pretool_sid`)를 기록한다.
-    * PreToolUse Read는 `*.read.json`에 PreToolUse 시점 SHA를 기록한다.
-    * lifecycle: PostToolUse가 동일 sid+path의 pre file을 로드해 결정 후 삭제한다.
+    * PreToolUse Write/Edit/MultiEdit은 `<sha1(key)>.<tool_use_id>.write.json`에 대상 파일 직전 SHA(`pre_sha`)와 PreToolUse sid(`pretool_sid`)를 기록한다.
+    * PreToolUse Read는 `<sha1(key)>.<tool_use_id>.read.json`에 PreToolUse 시점 SHA를 기록한다.
+    * `tool_use_id` per-file 접미어로 **동일 sid의 병렬 Read/Edit이 pre-record를 공유하지 않게** 한다(G2 보호: 병렬 Read A→B→PostReadA_deleteRecord→ReadB fallback으로 stale SHA를 `full_read`로 기록하는 race 차단). Claude Code가 tool call마다 발급하는 고유 ID를 사용.
+    * lifecycle: PostToolUse가 동일 sid+path+tool_use_id의 pre file을 로드해 결정 후 삭제한다.
+    * **정상 상태의 pre-record 부재는 gate 통과 evidence로 사용 금지**: PostToolUse가 pre file 못 찾으면 R4 2nd-pass orphan 절차로 진입해 STATE_RECORD_FAILED marker 기록(현 sid gate 차단). 부재를 새 SHA로 fallback하지 않는다.
     * Deny 시(특히 `OVERWRITE_RACE`/`STATE_RECORD_FAILED`)에도 PreToolUse hook은 본인이 만든 `pre/` 파일을 즉시 삭제한다(poisoned pre_sha 방지).
-    * GC: hook 시작 시 24시간 초과된 `pre/<sid>/` 파일을 삭제한다.
+    * GC: **R6 precedence #5b에서 수행**(sessions/ GC와 같은 pass). 24시간 초과된 `pre/<sid>/*.write.json`/`.read.json` 파일을 best-effort unlink. G5 invariant(precedence #1~#3 mutation 금지) 준수 — hook 시작 시점에는 어떤 GC도 수행하지 않는다.
 * `sessions/<sid>.json` 내용: `{ "schema_version": 1, "pid": <claude-code-pid>, "start_ms": ..., "uid": ..., "renewed_ms": ... }`.
     * **claude-code-pid 획득 규약**: hook은 자체 PID(`getpid()`) 대신 **부모 Claude Code 프로세스의 PID**를 사용한다. 우선순위:
         1. 환경변수 `CLAUDE_CODE_PID`가 set + 유효 정수 + `kill(pid, 0)` 성공이면 사용(Claude Code가 hook spawn 시 명시 주입한 값).
@@ -234,9 +237,9 @@ State는 `.claude/state/eghs/` 아래 다음 구조로 저장한다.
         1. `renewed_ms`가 `session_stale_seconds`(기본 86400) 경과.
         2. lease의 `uid`가 현재 hook 프로세스 uid와 같음.
         3. `pid` 프로세스가 dead(`kill(pid, 0)` ESRCH).
-        GC 시 같은 sid의 baselines/<sid>.txt + verify-logs/<sid>/ + debug/<sid>.jsonl + pre/<sid>/ + failed/<sid>/ + **locks/stop-<sid>.lock + locks/stop-<sid>.recover.lock** cascade unlink(eghs-migrate와 동일 정책). stop-lock류가 GC 대상에 포함되지 않으면 mid-Stop crash 시 UUIDv4 sid 재사용 없음으로 인해 영구 orphan(§G5 위반).
+        GC 시 같은 sid의 baselines/<sid>.txt + verify-logs/<sid>/ + debug/<sid>.jsonl + pre/<sid>/ + failed/<sid>/ + **locks/stop-<sid>.lock + locks/stop-<sid>.recover.lock + sessions/<sid>.guard.lock + sessions/<sid>.tombstone** cascade unlink(eghs-migrate와 동일 정책). stop-lock/guard/tombstone류가 GC 대상에 포함되지 않으면 mid-hook crash 시 UUIDv4 sid 재사용 없음으로 인해 영구 orphan(§G5 위반). **순서**: `sessions/<sid>.guard.lock` 은 `sessions/<sid>.json` **이전**에 unlink(guard가 lease에 종속; lease unlink 후 guard 잔존 시 orphan).
     * Foreign-uid 또는 EPERM 케이스: 자동 GC는 lease를 건드리지 않는다. multi-user 환경에서 죽은 다른 uid lease가 영구 잔존하면 `eghs-migrate --force-foreign-cleanup`(admin 옵션)으로 수동 정리한다. `--force-foreign-cleanup`은 `migrate.lock` 획득 후 모든 foreign-uid lease 중 `renewed_ms`가 `session_stale_seconds × 2` 초과한 것만 삭제한다(보수적).
-    * `eghs-migrate`는 `sessions/` 디렉토리가 비어있을 때만 동작한다(GC 후 평가). `locks/`도 비어 있어야 한다.
+    * `eghs-migrate`는 `sessions/` 디렉토리가 비어있을 때만 동작한다(GC 후 평가). `locks/`도 **`admin-mutex.guard` 를 제외하고** 비어 있어야 한다(admin-mutex.guard는 CLI 조작의 mutex이므로 존재가 정상).
 * `locks/stop-<sid>.lock` 내용 JSON `{pid, uid, start_ms, timeout_ms}`. recursion만 막는다.
     * **Exclusive lock 획득 절차** (R2.5 atomic-write의 rename-overwrite 의미와는 다름):
         1. 후보 본문(`{pid, uid, start_ms, timeout_ms}`)을 `locks/tmp/stop-<sid>.<pid>.<seq>`에 쓰고 fsync.
@@ -258,7 +261,7 @@ State는 `.claude/state/eghs/` 아래 다음 구조로 저장한다.
            d. 동일하면 stale lock unlink 후 본 link 절차로 새 lock 획득.
            e. 본 lock 획득 성공 시 recover.lock unlink. 절차 중 어떤 단계든 실패하면 보조 lock 정리 후 block 반환.
         5. **recover.lock 진입형 GC**: R6 precedence **#5**(kill switch와 CI passthrough 통과 이후)에서 best-effort 수행. 절차는 R6 #5 참조. kill switch 환경에서는 이 mutation도 발생하지 않는다(G5 보장).
-    * `eghs-migrate` precondition은 `locks/`가 다음 중 하나여야 한다: (a) 디렉토리 부재, (b) 비어 있음, (c) **모든 잔존 `stop-<sid>.lock` 및 `stop-<sid>.recover.lock`의 대응 sid lease가 sessions/에 없거나 dead lease**. (c) 조건이면 eghs-migrate가 **step 4 sessions/ GC 직후**(역할 검증=step 3 다음) 해당 lock 파일들을 best-effort unlink하고 진행한다(같은 GC pass에서 orphan으로 확정된 lock만 삭제). 살아있는 lease를 가진 lock이 단 하나라도 있으면 종료.
+    * `eghs-migrate` precondition은 `locks/`가 다음 중 하나여야 한다: (a) `admin-mutex.guard`만 존재(admin op에 필수), (b) `admin-mutex.guard` 및 **모든 잔존 `stop-<sid>.lock` 및 `stop-<sid>.recover.lock`의 대응 sid lease가 sessions/에 없거나 dead lease**. (b) 조건이면 eghs-migrate의 step 4 sessions/ GC cascade에서 stop-lock류가 함께 삭제되므로(§R2.5 eghs-migrate step 4 참조) 별도 처리 불필요. 살아있는 lease를 가진 lock이 단 하나라도 있으면 종료. clean-install(state dir 자체 부재) 시 eghs-migrate는 abort — 부트스트랩은 eghs-init 책임.
 * `debug/<sid>.jsonl`은 GC: `verify-logs/`와 동일 정책. `sessions/<sid>.json` lease가 부재(GC됨)이고 mtime이 `verify_logs_stale_seconds`(기본 7일) 경과면 삭제.
 * `verify-logs/`는 GC: **R6 precedence #5b (sessions/ GC와 같은 pass)에서 수행**. G5 invariant(no mutation in #1~#3) 준수. 다음 모두 만족하면 삭제.
     * 디렉토리 mtime이 `verify_logs_stale_seconds`(기본 7일) 경과.
@@ -289,17 +292,75 @@ State는 `.claude/state/eghs/` 아래 다음 구조로 저장한다.
     * **역할 검증** (lock 획득 직후):
         * `eghs-init`은 `schema_version` 파일이 **부재**여야만 진행. 존재 시 stderr `[eghs-init] schema_version already exists; use eghs-migrate to upgrade` 출력 후 lock 해제, 비-zero exit.
         * `eghs-migrate`는 `schema_version` 파일이 **존재**해야만 진행. 부재 시 stderr `[eghs-migrate] schema_version absent; use eghs-init to bootstrap` 출력 후 lock 해제, 비-zero exit.
-        * `eghs-init --repair`는 다음 세 케이스에 한해 허용:
+        * `eghs-init --repair`는 다음 네 케이스에 한해 허용:
             1. `schema_version` **존재하지만 INVALID**(strict regex 위반).
             2. `schema_version` 정상이지만 state subdir 하나 이상 부재(부분 초기화/수동 삭제 회복).
             3. `schema_version` 정상 + 모든 subdir 정상 + **`fs-info.json` 부재**(수동 삭제/외부 정리 회복). FS_INFO_MISSING dead-end 방지: fs-info는 subdir도 아니고 schema_version과도 별개이므로 별도 case 필요.
-          세 케이스 모두: subdir mkdir -p (idempotent) + 1번 케이스이면 schema_version atomic rewrite + 3번 케이스이면 fs-info.json probe 재수행 (5/6단계만 수행, schema_version 재작성 skip). 정상 schema + 모든 subdir + fs-info.json 존재인 상태에서 `--repair` 호출은 no-op + exit 0(idempotent). plain `eghs-init`은 세 케이스 모두 거부, `eghs-migrate`도 거부(stderr 안내).
+            4. `schema_version` 정상 + 모든 subdir 정상 + **`fs-info.json` 존재하지만 `flock_ok !== true` 또는 corrupt JSON 또는 필수 필드(`schema_version`/`caseless_fs`/`flock_ok`/`fs_st_dev`/`fs_statfs_id`) 누락 또는 FS anchor(`fs_st_dev`/`fs_statfs_id`) 부재/불일치**(legacy cache from pre-R20 install, partial-write corruption, 또는 state dir이 다른 FS로 이동됨). fs-info.json 삭제 후 재 probe(#3.3 검증 항목과 정확히 일치).
+          네 케이스 모두: subdir mkdir -p (idempotent) + 1번 케이스이면 schema_version atomic rewrite + 3/4번 케이스이면 fs-info.json probe 재수행 (5/6단계만 수행, schema_version 재작성 skip). 정상 schema + 모든 subdir + fs-info.json (flock_ok=true, anchor 일치) 존재인 상태에서 `--repair` 호출은 no-op + exit 0(idempotent). plain `eghs-init`은 네 케이스 모두 거부, `eghs-migrate`도 거부(stderr 안내).
+    * **`eghs-migrate --clear-sid <SID>`** (lease/baseline corruption 회복 전용 관리자 명령): 손상된 개별 sid(대응 hook이 `INFRA_NOT_READY reason=lease_unavailable`을 반복 반환하는 경우)를 명시적으로 정리한다. 절차:
+        0. **admin-mutex 획득** (`locks/admin-mutex.guard` LOCK_EX). eghs-init/eghs-migrate/--clear-migrate-lock/--clear-init-lock과 직렬화. 공통 순서: `admin-mutex → migrate.lock → sid guard`. timeout(예: 30s) 초과 시 abort.
+        1. `migrate.lock`을 `O_CREAT|O_EXCL`로 획득(다른 sid 활동 방해 최소화 위해 sessions/ empty 요구 안 함). 실패 시 admin-mutex 해제 후 abort.
+        2. `sessions/<SID>.json` stat 및 body read (uid + pid 확인 위해).
+        3. **UID 게이트**:
+            - lease body의 `uid` != 현재 uid → **`--force-foreign-cleanup` 지정 필수**(단순 `--force`는 foreign-uid에 무효). `--force` 단독 지정 시 stderr `[eghs-migrate] sid <SID> foreign uid; use --force-foreign-cleanup instead` + 종료. `--force-foreign-cleanup` 지정 시 액세스 가능 여부(EACCES)만 확인 후 4단계 진행.
+            - lease 파일 부재(baseline만 corrupt) → uid 검증 skip, 4단계 진행.
+            - lease body parse 실패 → uid 미확인 상태. 파일 stat(`st_uid`)로 owner uid 확인 후 위 규칙 적용.
+        4. **PID liveness rule** (uid gate 통과 후):
+            - **lease body parse 실패 (PID 필드 부재/corrupt)** → PID liveness 판정 불가. `--force` 필수. `--force` 미지정 시 stderr `[eghs-migrate] sid <SID> lease body corrupt; --force required for cleanup` + 종료. `--force` 지정 시 tombstone+guard barrier 절차로 바로 진행(5단계). 이 경로 없이는 corrupt lease의 유일 escape hatch가 봉쇄됨.
+            - pid dead(`kill(pid, 0)` ESRCH) → 5단계 진행.
+            - pid alive AND `--force` 미지정 → stderr `[eghs-migrate] sid <SID> lease pid alive; refusing without --force` + 종료(비-zero exit).
+            - pid alive AND `--force` 지정 → **tombstone 절차 필수** (race guard, 아래 5단계).
+            - same-uid EPERM → 5단계 진행(sandbox/namespace 비정상은 dead로 간주하되 debug log 기록).
+        5. **Tombstone + guard barrier (BLOCKER race close, §R6 #3.7 참조)**:
+           a. `sessions/<SID>.tombstone` link(2) exclusive create. body `{cleared_by_pid, cleared_by_uid, ts_ms, reason: "clear-sid"}`.
+              - EEXIST 시: 기존 tombstone body read → owner uid/pid 검증 (§R6 #3.7 "재개 절차"와 동일). foreign-uid 또는 alive/EPERM → abort. same-uid + dead → 기존 tombstone identity(inode + sha256) snapshot 후 5c로 진행(재개).
+           b. **hook drain 관측**: `sessions/<SID>.guard.lock`에 대해 `open(O_RDWR|O_CREAT|O_CLOEXEC) + flock(LOCK_EX)` 시도 (blocking, timeout `wait_grace_ms=90000ms`). 성공 = 활성 hook 없음, 안전 진입. timeout = hook drain 지연, abort(stderr `hooks did not drain within grace; retry`; tombstone 잔존 → 후속 hook은 여전히 sid_cleared로 block, disk consistency 유지).
+           c. (지웠음 — b에서 flock으로 drain 관측 통합)
+        6. R2.5 sessions cascade delete와 동일한 절차 실행 (§R2.5 §238 + R6 #5b verbatim 동일 set): `sessions/<SID>.guard.lock` unlink(exclusive flock hold → close 이전에 unlink; lease보다 먼저) + `sessions/<SID>.json` unlink + `baselines/<SID>.txt` + `verify-logs/<SID>/`(rm -rf) + `debug/<SID>.jsonl` + `pre/<SID>/`(rm -rf) + `failed/<SID>/`(rm -rf) + `locks/stop-<SID>.lock` + `locks/stop-<SID>.recover.lock` + key-scoped `failed/<sha1(*)>.json` 중 `origin_sid == <SID>`인 것 unlink.
+        7. `sessions/<SID>.tombstone` unlink (cleanup 완료 → 게이트 해제; UUIDv4 sid는 재사용되지 않으므로 tombstone 잔존해도 무해하지만 명시적 정리로 disk 사용 최소화).
+        8. `migrate.lock` 해제 후 **admin-mutex 해제**. exit 0.
+      본 명령은 `sessions/`가 비어있을 필요 없음(개별 sid 정리이므로). 안전 gate는 0단계 admin-mutex + 3단계 UID + 4단계 PID + 5단계 tombstone(race guard). corrupt-lease/corrupt-baseline 무한 loop의 유일 escape hatch.
+    * **`eghs-migrate --clear-migrate-lock`** (corrupt/non-regular migrate.lock escape): 일반 eghs-migrate가 non-regular type 또는 corrupt body의 `migrate.lock`을 만나면 abort하는데, hook도 동일 case에서 `INFRA_NOT_READY reason=migrate_lock_corrupt` 반환 → self-heal 불가. 본 CLI는 lock 정리 전용:
+        1. **`lstat("migrate.lock")` 로 type + owner 확인**(NOFOLLOW, symlink 자체 정보; FIFO에 open()해서 blocking 되는 위험 회피). ENOENT → no-op exit 0.
+        2. **Type-분기 처리** (모든 branch가 `uid` gate 공통 적용: `st_uid != 현재 uid` → `--force-foreign-cleanup` 필수, 미지정 시 abort):
+           - **symlink** (`S_ISLNK`) → 곧바로 `unlink` (target 접근 안 함, symlink attack 회피).
+           - **FIFO/socket** (`S_ISFIFO`/`S_ISSOCK`) → `unlink` 로 즉시 제거(open 시 block 위험).
+           - **directory** (`S_ISDIR`) → **비어있으면 `rmdir`, 안 비어있으면 abort**(수동 조사 필요; `rm -rf` 자동 금지 — data loss risk). stderr `directory not empty; manual cleanup required`.
+           - **regular file** (`S_ISREG`) → **step 3으로 진행**.
+           - 기타(character/block device 등) → abort(stderr `unexpected file type`; 수동 조사).
+        3. **regular file case: identity snapshot + body 검증**:
+           a. `open(O_RDONLY|O_NOFOLLOW)` + `fstat` → identity snapshot `(st_ino, st_dev, size, mtime_ns)` + body sha256 계산.
+           b. body 검증:
+              - body parse 실패 또는 `uid`/`pid`/`start_ms` 필드 sanity 실패 → corrupt 판정, step 4로.
+              - body OK + `body.uid != st_uid` (심층 anomaly) → corrupt 판정, step 4로.
+              - body OK + same-uid + `kill(pid, 0)` 성공 alive → abort(stderr `held by pid=<PID>`; live migrate 침해 금지).
+              - body OK + same-uid + dead + grace 미경과 → abort(stderr `dead but within grace`).
+              - body OK + same-uid + dead + grace 경과 → 정상 stale, step 4로.
+        4. **Global mutex under migrate.lock alternative**: unlink TOCTOU race close 를 위해 **`locks/admin-mutex.guard`**(regular file, sid-agnostic) 을 `flock(LOCK_EX)`로 획득 (`--clear-sid`가 sid guard 쓰듯 lock 조작이 이 mutex 안에서만 발생). eghs-init/eghs-migrate/`--clear-migrate-lock`/`--clear-init-lock` 모두 mutex 안에서만 migrate.lock 및 .init.lock을 open/create/unlink 한다. mutex 획득 실패 시 abort(다른 admin op 진행 중).
+        5. **mutex hold 상태에서 identity 재검증**: `lstat` 재수행 → 1단계 결과와 type 일치 확인. regular file case 는 `open+fstat+body sha256` 재수행 → 3a snapshot 전체(`st_ino, st_dev, size, mtime_ns, body_sha256`) 일치 필수. 불일치 → 다른 프로세스가 lock 새로 만든 상태 → mutex 해제 + abort(stderr `lock replaced during check; retry`). 최대 3회 retry.
+        6. mutex hold 상태에서 `unlink`/`rmdir` 수행 후 mutex 해제. exit 0.
+    * **`eghs-migrate --clear-init-lock`** (corrupt/non-regular `.init.lock` escape): 절차는 `--clear-migrate-lock`과 동일 (lstat type 분기 + identity snapshot + `locks/admin-mutex.guard` mutex + 재검증)하되 대상 파일은 `.init.lock`. 본 명령도 mutex 안에서만 조작. 이 공통 mutex로 admin lock ops(migrate.lock 및 .init.lock 관련)이 단일 직렬화되어 두 admin 동시 실행 시 fresh valid lock kill 방지.
 * `eghs-init` 동작 절차(`migrate.lock` mutex 포함):
-    1. `migrate.lock` stale 회수: hook precedence #4 stale rule을 적용. 다른 uid 또는 살아있는 lock 시 종료.
+    0. **admin-mutex 획득 (bootstrap-safe)**: `.claude/state/eghs/locks/` 디렉토리를 `mkdir -p`로 idempotent 생성(state root과 locks/만 우선 생성; 나머지 subdir은 step 5에서). `locks/admin-mutex.guard`를 `open(O_RDWR|O_CREAT|O_CLOEXEC) + flock(LOCK_EX)`. 다른 admin op(--clear-migrate-lock/--clear-init-lock/eghs-migrate/eghs-init/--clear-sid) 진행 중이면 blocking. timeout(예: 30s) 초과 시 abort. 이 mutex 안에서만 migrate.lock/.init.lock 조작.
+    1. `migrate.lock` stale 회수: hook precedence #4 stale rule을 적용. 다른 uid 또는 살아있는 lock 시 종료(mutex 해제).
     2. `migrate.lock`을 `O_CREAT|O_EXCL`로 획득. lock 내용 `{pid, uid, start_ms, role: "init"}`.
-    3. 역할 검증: `schema_version` 부재 확인 (또는 `--repair` 플래그 + (INVALID 또는 정상 schema + state subdir 일부 부재 또는 정상 schema + 모든 subdir 정상 + fs-info.json 부재 또는 정상 schema + 모든 subdir + fs-info.json 정상=no-op)). 위 mutex 정의 일치.
-       * `--repair` 실행 시 Case별 단계 skip: Case 1(INVALID) → 5·6·7 모두 수행. Case 2(subdir 부재) → 5 수행, 6 조건부, 7 skip. Case 3(fs-info 부재) → 5 skip(모든 subdir 정상), 6 수행, 7 skip. Case 4(no-op) → 5·6·7 skip.
-    4. `.init.lock` acquire(내부 단계 보호).
+    3. 역할 검증: `schema_version` 부재 확인 (또는 `--repair` 플래그 + (INVALID 또는 정상 schema + state subdir 일부 부재 또는 정상 schema + 모든 subdir 정상 + fs-info.json 부재/unhealthy 또는 정상 schema + 모든 subdir + fs-info.json 정상=no-op)). 위 mutex 정의 일치.
+       * `--repair` 실행 시 Case별 단계 skip:
+         - Case 1 (INVALID schema) → 5·6·7 모두 수행.
+         - Case 2 (subdir 부재) → 5 수행, 6 조건부, 7 skip.
+         - Case 3 (fs-info.json 부재) → 5 skip(모든 subdir 정상), 6 수행, 7 skip.
+         - **Case 4 (fs-info.json unhealthy: `flock_ok !== true` OR corrupt JSON OR 필수 필드 누락 OR FS anchor 불일치)** → 5 skip, **기존 fs-info.json unlink 후 6 수행(재 probe)**, 7 skip.
+         - Case 5 (모두 정상 = no-op) → 5·6·7 skip, exit 0(idempotent).
+    4. `.init.lock` acquire(내부 단계 보호). **body: `{pid, uid, start_ms}`.** `.init.lock`이 이미 존재하면 stale 회수 규칙 적용(migrate.lock과 대칭 + §691 lease 검증과 대칭):
+       * body parse 실패 → abort(stderr `[eghs-init] .init.lock body parse fail; remove <path>/.init.lock or run \`eghs-migrate --clear-init-lock\``).
+       * body의 `pid` 필드 부재/음수/`> 2^53-1`, `start_ms` 필드 **부재/parse 실패/음수/`> 2^53-1`/`> now_ms + far_future_grace_ms`(기본 86400000 = 24h, §R6 lease sanity와 동일 constant 사용 — clock-skew NTP correction/VM resume 정상 범위 통과, 명백한 corruption만 차단), `uid` 필드 부재/parse 실패** → abort with stderr `[eghs-init] .init.lock body corrupt; use \`eghs-migrate --clear-init-lock\``. body가 JSON parse는 되지만 field-level sanity 실패도 corrupt case로 취급(silent deadlock 방지). **주의**: `init_lock_grace_ms`(60s)는 stale-dead lock 회수 grace(=lock life span 상한)이지 clock-skew tolerance가 아니다; 두 constant는 의미가 다르므로 절대 겹치지 마라(60s로 clock-skew 판정하면 NTP step correction에 false corrupt).
+       * uid != 현재 uid → abort(stderr `[eghs-init] .init.lock foreign; aborting`).
+       * same-uid + `kill(pid, 0)` 성공(alive) → abort(stderr `[eghs-init] .init.lock held by pid=<PID>; aborting`).
+       * same-uid + `kill(pid, 0)` ESRCH(dead) + `start_ms + init_lock_grace_ms` (기본 60s) 경과 → stale 판정, unlink 후 재획득 1회. 그래도 실패 시 abort.
+       * same-uid + dead + grace 미경과 → abort(짧은 crash 직후 보호). 사용자는 grace 경과 후 재시도.
+       **init_lock_grace_ms=60s 근거**: init step 5(subdir mkdir) + step 6(fs-info probe) + step 7(schema_version atomic write)의 wall-clock 상한(로컬 FS 기준 수 초 수준)에 안전 마진 포함. 60s 초과 실제 실행 시 hang/deadlock 의심 신호. --repair 재시도 봉쇄 최대 60s는 disk-hot-recovery 목적상 허용 가능(수 초 wait으로 무한 봉쇄 대체).
+       본 규칙 부재 시 SIGKILL/crash로 leak된 `.init.lock`이 향후 모든 `eghs-init`/`eghs-init --repair`를 영구 봉쇄(migrate도 `.init.lock`을 건드리지 않으므로 self-heal 경로 없음 → `--clear-init-lock` CLI 별도 제공).
     5. **State subdir 생성** (mkdir -p, 모두 존재해야 hook이 INFRA_NOT_READY 없이 진행):
        * `tmp/` (root-level, schema_version/fs-info.json atomic write용)
        * `reads/`, `reads/tmp/`
@@ -311,14 +372,27 @@ State는 `.claude/state/eghs/` 아래 다음 구조로 저장한다.
        * `verify-logs/`
        * `debug/`
        모든 디렉토리는 0700 권한으로 생성(권한 운영 가이드 §R6).
-    6. `fs-info.json` 부재 시 probe 절차(R2 참조)로 생성.
+    6. `fs-info.json` **unhealthy predicate** (§3.3와 정확히 일치) 이면 기존 파일 unlink 후 probe 절차(R2 참조)로 재생성: **부재 OR regular file 아님 OR size > 4KB OR JSON parse 실패 OR 필수 필드(`schema_version`/`caseless_fs`/`flock_ok`/`fs_st_dev`/`fs_statfs_id`) 누락/type 불일치 OR `flock_ok !== true` OR FS anchor(`fs_st_dev`/`fs_statfs_id`) 불일치**. 이 predicate 없이 Case 1(INVALID schema)만 처리하면 동반 fs-info 손상이 잔존해 hook이 계속 `INFRA_NOT_READY`로 차단됨. **flock capability probe**:
+       a. 부모: `.claude/state/eghs/tmp/flock-probe.<pid>.<seq>` 경로 `parent_fd = open(O_RDWR|O_CREAT|O_CLOEXEC)` → `flock(parent_fd, LOCK_EX|LOCK_NB)`. 실패(ENOTSUP/EOPNOTSUPP/EINVAL/EWOULDBLOCK) → fail-closed(아래).
+       b. `fork()` 후 자식: **상속 fd 사용 금지**. `close(parent_fd)` (또는 이미 O_CLOEXEC로 exec 후 별 프로세스에서 처리) → 동일 경로를 **별도로** `child_fd = open(O_RDWR|O_CLOEXEC)` (O_CREAT 없음, 이미 존재) → `flock(child_fd, LOCK_EX|LOCK_NB)`. **반드시 EWOULDBLOCK 반환해야 정상**. 성공 반환(자식이 lock 획득) 시 flock 지원 안 됨(silent no-op FS). ENOTSUP/EINVAL 등도 동일 실패 처리. 자식은 결과 코드를 exit로 반환.
+       c. 부모: 자식 exit 값이 "EWOULDBLOCK expected" 아니면 **fail-closed**: stderr `[eghs-init] flock not supported on this filesystem (likely NFS/CIFS/silent-noop); EGHS requires local POSIX flock-capable FS` + 비-zero exit. 부모 lock 해제 후 probe 파일 unlink.
+       d. 성공 시 `fs-info.json`에 다음 필드 추가: `"flock_ok": true`, `"fs_st_dev": <state root의 st_dev>`, `"fs_statfs_id": <platform-normalized FS type identifier>`. **Platform-normalized `fs_statfs_id`**:
+          * Linux: `statfs.f_type` (integer, e.g. `0xef53` for ext4). 필드명 `fs_statfs_id`에 정수값 그대로 저장.
+          * macOS/BSD: `statfs.f_fstypename` (문자열, e.g. `"apfs"`, `"hfs"`). Linux integer와 구분 위해 문자열로 저장.
+          * 값 저장 시 platform tag 접두어 사용: `"linux:0xef53"` 또는 `"darwin:apfs"`. 비교 시 tag+value 모두 일치해야 정상.
+          * 다른 platform(FreeBSD/Solaris 등): `"posix:<uname 값>"`으로 fallback. 미지원 platform은 §3 Non-goal.
+       hook은 매 실행마다 fs-info.json 읽어 `flock_ok !== true` 시 `INFRA_NOT_READY reason=infra_not_ready`로 fail-closed 반환(stderr `run: eghs-init --repair to re-probe`). 또한 매 hook 시작 시 state root의 `st_dev` + platform-normalized statfs id 를 확인해 fs-info.json cache와 불일치 시 **동일하게 fail-closed**(FS 이동 감지). remediation은 `eghs-init --repair`. guard rwlock과 admin-mutex 정확성은 flock 지원에 종속되므로 미지원 FS는 지원 밖.
     7. `schema_version`을 R2.5 atomic write로 작성(**strict 형식 `^[1-9][0-9]*\n$` 최대 32바이트**; 코드 버전 ≥ 1). `0\n`이나 선행 0(`01\n`) 금지 — precedence #1 reader와 동일 규칙. **반드시 5/6단계 완료 후에 schema_version을 마지막으로 작성**(schema 존재 = 모든 인프라 준비 완료의 단일 signal).
-    8. probe 파일, `.init.lock`, `migrate.lock` 순서로 삭제.
+    8. probe 파일, `.init.lock`, `migrate.lock` 순서로 삭제. **admin-mutex 해제**.
 * `eghs-migrate` 동작 절차:
-    1. `migrate.lock` stale 회수: 기존 `migrate.lock`이 있으면 hook의 precedence #4 stale rule(same uid + dead + grace 경과)을 그대로 적용. 다른 uid lock 또는 살아있는 lock 시 종료. migrate.lock이 regular file이 아닌 비정상 type이면 stderr에 `[eghs-migrate] migrate.lock is not a regular file; aborting` 출력 후 비-zero exit.
+    0. **admin-mutex 획득**: `locks/admin-mutex.guard`를 `open(O_RDWR|O_CREAT|O_CLOEXEC) + flock(LOCK_EX)`. eghs-init/--clear-*와 직렬화. timeout(예: 30s) 초과 시 abort. (`locks/` 부재이면 abort — eghs-migrate는 부트스트랩 대상이 아니며 state dir 부재 시 eghs-init 필요.)
+    1. `migrate.lock` stale 회수: 기존 `migrate.lock`이 있으면 hook의 precedence #4 stale rule(same uid + dead + grace 경과)을 그대로 적용. 다른 uid lock 또는 살아있는 lock 시 종료. **`--force-foreign-cleanup` 지정 시**: foreign-uid lock에 한해 stale 검증(uid stat + `kill(pid, 0)` ESRCH + `start_ms + foreign_migrate_lock_grace_ms` (기본 7200s) 경과) 후 unlink 허용(살아있는 foreign lock은 여전히 abort). 이 경로가 없으면 foreign-stale migrate.lock 감지 시(hook의 precedence #4에서 안내됨) `--force-foreign-cleanup` 실행 자체가 abort되어 self-heal 봉쇄. migrate.lock이 regular file이 아닌 비정상 type이면 stderr에 `[eghs-migrate] migrate.lock is not a regular file; use --clear-migrate-lock` 출력 후 비-zero exit(별도 CLI로 위임).
     2. `migrate.lock`을 `O_CREAT|O_EXCL`로 획득. lock 내용 `{pid, uid, start_ms, role: "migrate"}`.
     3. 역할 검증: `schema_version` 존재 + 파싱 성공 확인(INVALID이면 종료, init 안내).
-    4. lock 획득 후 `sessions/` 디렉토리를 GC 절차(pid liveness + uid + TTL)로 정리. `--force-foreign-cleanup` 플래그가 있으면 foreign-uid stale lease도 정리. **각 GC된 sid에 대해 cascade delete**: `baselines/<sid>.txt` unlink, `verify-logs/<sid>/` `rm -rf`, `debug/<sid>.jsonl` unlink, `pre/<sid>/` `rm -rf`, `failed/<sid>/` `rm -rf`(orphan sid-scoped marker도 정리). **모두 best-effort**: ENOENT와 EPERM 둘 다 silently skip(foreign-uid 파일 cleanup 권한 부족 시 orphan으로 남겨두고 다음 GC pass에서 표면화). EPERM이 발생한 sid는 sessions/<sid>.json 자체 unlink도 함께 skip해 cascade desync 차단(sessions GC와 cascade cleanup의 원자성 보존).
+    4. lock 획득 후 `sessions/` 디렉토리를 GC 절차(pid liveness + uid + TTL)로 정리. `--force-foreign-cleanup` 플래그가 있으면 foreign-uid stale lease도 정리. **각 GC된 sid에 대해 cascade delete** (R2.5 §238 + R6 #5b와 verbatim 동일 set): `baselines/<sid>.txt` unlink, `verify-logs/<sid>/` `rm -rf`, `debug/<sid>.jsonl` unlink, `pre/<sid>/` `rm -rf`, `failed/<sid>/` `rm -rf`(orphan sid-scoped marker도 정리), **`locks/stop-<sid>.lock` unlink, `locks/stop-<sid>.recover.lock` unlink**, **`sessions/<sid>.guard.lock` unlink**(lease unlink 이전), **`sessions/<sid>.tombstone` unlink**(orphan tombstone 회수). **모두 best-effort**: ENOENT와 EPERM 둘 다 silently skip. EPERM이 발생한 sid는 sessions/<sid>.json 자체 unlink도 함께 skip해 cascade desync 차단.
+       **추가로 orphan stop-lock scan** (TTL-비의존 정리, precondition (c) 조건 충족용): `locks/` 디렉토리를 1회 scan해 `stop-<sid>.lock` 및 `stop-<sid>.recover.lock` 파일별로:
+        * 대응 `sessions/<sid>.json`이 부재이거나 lease body pid가 dead(`kill(pid, 0)` ESRCH)이면 → orphan 판정, best-effort unlink. body가 alive이거나 same-uid EPERM이면 건드리지 않음(살아있는 Stop 침해 금지).
+       본 scan은 TTL 무관하게 lease liveness만 확인 — 이 단계 없이는 crash된 short-lived 세션의 stop-lock이 TTL(기본 24h)까지 살아남아 precondition (c)를 실패시켜 step 5가 abort. senior R17 #5 fix.
     5. `sessions/`가 비어 있고 `locks/` precondition(상기 stop/recover lock 규칙)이 만족되면 schema 갱신 진행. 비어 있지 않으면 사용자에게 활성 세션 안내 후 lock 해제하고 종료.
     6. **Per-record schema 정리** (schema bump 시 v→v+1 마이그레이션): bump이면 다음을 수행 후 schema_version 파일 갱신.
         * `reads/*.json` 전체 unlink(GC TTL 무시, 즉시 삭제). cross-session evidence는 schema 변경 시 무효화하는 것이 가장 안전(evidence 손실은 다음 Read에서 재생성됨; G1 일관성 유지가 우선).
@@ -327,7 +401,7 @@ State는 `.claude/state/eghs/` 아래 다음 구조로 저장한다.
         * 본 단계는 trace 모드(`--dry-run`)로 사전 검토 가능해야 한다(MVP 도구 §8).
         이 정책은 per-record body의 `schema_version` 필드 호환성 처리 코드를 hook에서 제거할 수 있게 해 단순성/안전성을 모두 확보한다. record의 자체 `schema_version` 필드는 디버깅/감사용으로만 유지하며, hook 동작 분기에는 사용하지 않는다.
     7. schema 갱신은 R2.5 atomic write 절차(destination-local tmp + fsync + same-dir rename + dir fsync)로 `schema_version` 파일을 갱신한다. 비-atomic truncate+write 금지.
-    8. schema 갱신 완료 후 `migrate.lock` 삭제.
+    8. schema 갱신 완료 후 `migrate.lock` 삭제. **admin-mutex 해제**.
 * hook은 매 호출 precedence #4에서 `migrate.lock`을 체크해 `eghs-migrate` 진행 중에는 hook-type 매트릭스에 따라 분류한다. 이는 `eghs-migrate` 본인의 lock 절차와 결합해 race를 차단.
 * **Precedence #1 ↔ #6 TOCTOU 방어**: hook은 precedence #6(lease write) 직전에 `migrate.lock`을 재확인하고, lock이 존재하면 후보 `MIGRATE_IN_PROGRESS` → #4 매트릭스 적용. 또한 `disk_schema`를 #6에서 재읽기해 #1 시점 값과 다르면 동일 처리. 이로써 #1과 #6 사이에 migrate가 완주한 race도 안전하게 처리.
 
@@ -340,7 +414,7 @@ State는 `.claude/state/eghs/` 아래 다음 구조로 저장한다.
 **sid 형식 규약**:
 
 * `sid`는 **UUIDv4 lowercase string**(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)이어야 한다. Claude Code 본체가 제공하는 session_id가 이 형식을 만족한다고 가정한다.
-* hook은 input의 `session_id`를 strict regex로 검증한다. 위반 시 `NO_SESSION` 신호로 처리(R3 enum 참조)하여 state write 차단.
+* hook은 input의 `session_id`를 strict UUIDv4 regex로 검증한다. 위반 시 `NO_SESSION` deny로 처리(R3 enum 참조). PreToolUse는 fail-closed block, PostToolUse는 short-circuit exit 0. 자세한 hook 별 분기는 precedence #3.5 참조.
 * 이는 sid 충돌(누군가가 GC된 sid를 재사용) risk를 무력화하기 위함(UUIDv4 collision 확률 무시 가능).
 * **Baseline reuse 가드**: precedence #6.3a/b/c 절차에 정식 명세. anchor는 baseline body의 `lease_start_ms` + `lease_pid` 필드(sessions/<sid>.json과 동일). 이는 GC 누락 + UUIDv4 충돌(이론적) + 동시 sid 점유(implementation bug) 모두에 대한 검증 anchor.
 
@@ -367,7 +441,7 @@ State는 `.claude/state/eghs/` 아래 다음 구조로 저장한다.
 * canonical key가 repo root 외부에 위치하면 **gate skip**(deny 아님)으로 처리한다(외부 모듈 편집 등은 EGHS 범위 밖).
 * canonical key가 `state_gate_paths` 매칭 규칙을 통과하고 디스크에 파일이 존재하면 gate 적용 대상이다.
 * 파일이 존재하지 않으면 신규 파일 `Write` 후보다:
-    1. PreToolUse는 `pre_sha: null`을 `pre/<sid>/<sha1(canonical_key)>.write.json`에 기록하고 allow한다.
+    1. PreToolUse는 `pre_sha: null`을 `pre/<sid>/<sha1(canonical_key)>.<tool_use_id>.write.json`에 기록하고 allow한다.
     2. 결과 분류는 전적으로 R4 매트릭스에 위임한다.
     3. R4 매트릭스의 "overwrite race" 분류(에러 있음 + pre_sha=null + post_sha!=null)에서만 `OVERWRITE_RACE`로 다음 호출이 차단된다. 성공 분류(에러 없음 + pre_sha=null + post_sha!=null)는 best-effort new file success로 처리한다(§3 non-goal).
 
@@ -396,7 +470,7 @@ State는 `.claude/state/eghs/` 아래 다음 구조로 저장한다.
    * sid-scoped `failed/<current_sid>/<sha1(key)>.json` (현 sid 자체 marker).
    둘 중 하나라도 존재하면 marker 해제 정책 적용; 해제 불가면 deny.
 
-성공 시 hook은 `pre_sha = state.sha`를 `pre/<sid>/<sha1(canonical_key)>.write.json`에 기록하고 allow(`exit 0`)한다.
+성공 시 hook은 `pre_sha = state.sha`를 `pre/<sid>/<sha1(canonical_key)>.<tool_use_id>.write.json`에 기록하고 allow(`exit 0`)한다.
 
 Deny code 전체 enum:
 
@@ -411,15 +485,15 @@ Deny code 전체 enum:
 | `SCHEMA_NOT_INITIALIZED`   | `schema_version` 파일 부재    | Yes | `eghs-init` 실행 |
 | `FS_INFO_MISSING`          | case-sensitivity probe cache 부재 | Yes | `eghs-init` 실행 |
 | `MIGRATE_IN_PROGRESS`      | `eghs-migrate` 실행 중       | Yes | 잠시 후 재시도 |
-| `INFRA_NOT_READY`          | state dir 부재 또는 schema_version 비정상 file type, lease 기록 ENOENT/EACCES, state subdir 부재 등 인프라 결함 | No | `eghs-init` 실행 후 재시도(`--repair` 필요 시) |
+| `INFRA_NOT_READY`          | state dir 부재 또는 schema_version 비정상 file type, lease 기록 ENOENT/EACCES, state subdir 부재 등 인프라 결함 | No | **reason 필드로 분기**: (a) `reason=infra_not_ready/schema_invalid` 등 인프라 결함 → `eghs-init` 실행 후 재시도(`--repair` 필요 시). (b) `reason=lease_unavailable` (corrupt-lease/baseline sanity fail) → **`eghs-migrate --clear-sid <SID>` 실행** (본인 sid이면서 활성인 경우 `--force` 추가). (c) `reason=sid_cleared` → tombstone 존재. Claude Code 세션 재시작(새 sid 발급). (d) `reason=migrate_lock_corrupt` → `eghs-migrate --clear-migrate-lock` 실행. (`.init.lock` corruption은 hook에서 도달 불가 — hooks는 `.init.lock`을 stat하지 않음; 오직 `eghs-init` CLI stderr 안내로 `--clear-init-lock` 실행.) |
 | `SID_COLLISION`            | 같은 sid를 보유한 두 개의 활성 lease 감지 (anchor 불일치 + lease pid alive). Claude Code session_id 충돌 또는 구현 버그 신호. | No | hook 호출자 측 sid 발급 로직 점검; 한 세션 종료 후 재시도 |
 | `FILE_UNREADABLE`          | realpath/stat 실패           | Yes (제한적) | 파일 권한/존재 확인 |
 | `INPUT_PARSE`              | hook input JSON 파싱 실패     | Yes | 작업 재시도 |
-| `NO_SESSION` (signal, deny 아님) | hook input에 session_id 없음 | n/a | hook은 `decision: "allow"`로 종료(gate skip)하되 debug log에 `deny_code: NO_SESSION` 기록. Edit은 차단하지 않음. enum 표기상 deny code와 함께 분류되나 실제 decision은 allow |
+| `NO_SESSION`               | hook input에 session_id 없음 또는 strict UUIDv4 regex 위반 | No | Claude Code sid 발급 로직 점검, 세션 재시작 후 재시도. Precedence #3.5에서 kill switch/CI passthrough 다음으로 평가. **PreToolUse Read/Write/Edit/MultiEdit는 fail-closed block**(G1 Read-before-Edit sid 없이 검증 불가). **PostToolUse는 short-circuit exit 0**(state 저장 위치 없음). **UserPromptSubmit는 fail-soft exit 0**(R1 사용자 입력 차단 금지). **Stop은 block auto-unblock=No**(G3) |
 
 `Auto-unblock`이 No인 deny code는 R6 kill switch 외에는 우회 불가.
 
-PreToolUse가 위 deny code 중 어느 하나라도 반환할 때, 본인이 작성했을 수 있는 `pre/<sid>/<key>.write.json` 임시 파일을 즉시 삭제한다(다음 호출에 stale pre_sha가 남지 않도록).
+PreToolUse가 위 deny code 중 어느 하나라도 반환할 때, 본인이 작성했을 수 있는 `pre/<sid>/<sha1(key)>.<tool_use_id>.write.json` 임시 파일을 즉시 삭제한다(다음 호출에 stale pre_sha가 남지 않도록).
 
 **MultiEdit 정책**:
 
@@ -435,17 +509,17 @@ PreToolUse가 위 deny code 중 어느 하나라도 반환할 때, 본인이 작
 
 **NO_SESSION 단락 (PreToolUse와 대칭)**:
 
-* hook input에 `session_id`가 없으면 PostToolUse Write/Edit/MultiEdit/Read는 **즉시 short-circuit**: state write 없음, marker 기록 없음, `pre/` 조회 없음, R4 매트릭스 진입 금지. debug log에 `deny_code: NO_SESSION` + `decision: skip`만 1줄 기록 후 exit 0.
+* hook input에 `session_id`가 없거나 strict UUIDv4 regex를 위반하면 PostToolUse Write/Edit/MultiEdit/Read는 **즉시 short-circuit**: state write 없음, marker 기록 없음, `pre/` 조회 없음, debug log write 없음(sid 없어 `debug/<sid>.jsonl` 경로가 정의되지 않음), R4 매트릭스 진입 금지. 관측이 필요하면 stderr에 `[eghs] NO_SESSION: no state or debug write` 1줄만 출력 후 exit 0. 본 결정은 precedence #3.5 NO_SESSION 로직과 대칭.
 * 이 분기 적용 후에야 아래 입력/매트릭스가 적용된다.
 
 **입력**:
 * `tool_response.error`: tool 실행 에러 유무.
-* `pre_file`: 1차로 `pre/<posttool_sid>/<key>.write.json` 검색.
+* `pre_file`: 1차로 `pre/<posttool_sid>/<sha1(key)>.<tool_use_id>.write.json` 검색.
     * 1차 hit → 정상.
     * 1차 miss → 2차 검색:
         1. `pre/` 디렉토리를 1회 enumerate해 `<sid>` 서브디렉토리 목록을 수집한다. **enumerate 시점의 wall clock을 `enum_ms`로 기록**.
         2. 각 sid에 대해 `sessions/<sid>.json` lease를 stat. lease가 부재이거나 GC 조건(R2.5)을 만족하는 dead lease이면 "dead sid" 후보로 분류. **lease가 존재하면 본문을 읽어 `renewed_ms`를 보관**.
-        3. dead sid 중 `pre/<dead_sid>/<key>.write.json`이 존재하는 sid를 orphan 후보로 본다. **각 orphan 후보의 pre file `mtime_ms`(`fstat` 결과)도 함께 보관**.
+        3. dead sid 중 `pre/<dead_sid>/<sha1(key)>.<tool_use_id>.write.json`이 존재하는 sid를 orphan 후보로 본다. **각 orphan 후보의 pre file `mtime_ms`(`fstat` 결과)도 함께 보관**.
         4. orphan이 1개 이상이면 unlink 직전 **TOCTOU 재검증** (normative — 단일 절차, 대안 없음):
            a. `sessions/<dead_sid>.json` lease를 re-stat.
            b. lease 부재 또는 dead(`kill(pid,0)` ESRCH) → orphan 확정.
@@ -478,7 +552,7 @@ PreToolUse가 위 deny code 중 어느 하나라도 반환할 때, 본인이 작
 
 * atomic write(R2.5 절차).
 * 성공 분류(`new file success`, `edit success`)에서 기존 failed marker는 R2 marker 해제 정책에 따라 제거한다.
-* PostToolUse는 마지막에 `pre/<sid>/<key>.write.json`을 삭제한다(crash 시 GC가 처리).
+* PostToolUse는 마지막에 `pre/<sid>/<sha1(key)>.<tool_use_id>.write.json`을 삭제한다(crash 시 GC가 처리).
 * `post_edit_success` state의 `sid` 필드는 `posttool_sid`. 위에서 `pretool_sid == posttool_sid` 보장 후 기록하므로 G1 invariant 유지.
 
 **신규 파일 evidence**:
@@ -488,7 +562,7 @@ PreToolUse가 위 deny code 중 어느 하나라도 반환할 때, 본인이 작
 **Failed marker key scope 정리** (sid-scoped vs key-scoped):
 
 * **Key-scoped** `failed/<sha1(key)>.json`: PostToolUse Write/Edit/MultiEdit 본인의 결과(매트릭스의 partial apply, overwrite race 등)로 인한 marker. 현 sid의 후속 Edit 차단이 의도.
-* **Sid-scoped** `failed/<owner_sid>/<sha1(key)>.json`: 다른 세션의 in-flight write에서 유래한 orphan/cascade marker, 또는 #4 매트릭스 fail-closed marker(migrate_in_progress/infra_not_ready/sid_collision/lease_unavailable/schema_invalid). 자기 sid(owner_sid == current_sid)에만 영향, cascade GC됨.
+* **Sid-scoped** `failed/<owner_sid>/<sha1(key)>.json`: 다른 세션의 in-flight write에서 유래한 orphan/cascade marker, 또는 #4/#3.7 매트릭스 fail-closed marker(migrate_in_progress/infra_not_ready/sid_collision/lease_unavailable/schema_invalid/sid_cleared/migrate_lock_corrupt). 자기 sid(owner_sid == current_sid)에만 영향, cascade GC됨.
 * **R3 gate 조건 5는 두 경로 모두 검사**: `failed/<sha1(key)>.json` (key-scoped) AND `failed/<current_sid>/<sha1(key)>.json` (sid-scoped). 둘 중 하나라도 존재하면 marker 해제 정책 적용; 해제 불가면 deny.
 * GC: sid-scoped는 `failed/<sid>/` 디렉토리가 sessions GC 시 cascade delete됨. key-scoped는 기존 R2 marker GC + 해제 정책 적용.
 
@@ -545,7 +619,7 @@ PreToolUse가 위 deny code 중 어느 하나라도 반환할 때, 본인이 작
 
 **결과**:
 
-* 하나라도 non-zero exit이면 exit 2 + **stderr**에 `[eghs] block <deny_code>: <reason>` 형식으로 실패 check 이름·exit code를 출력한다. (Claude Code Stop hook 계약: exit 2에서 stdout은 파싱되지 않고 stderr가 모델 피드백이 된다. allow는 exit 0 + 빈 stdout — `decision:"allow"` JSON은 Claude Code 출력 스키마(zod, decision enum `approve|block`)에 걸려 검증 실패한다.)
+* 하나라도 non-zero exit이면 exit 2 + **stderr**에 `[eghs] block <deny_code>: <reason> sid=<sid>` 형식으로 실패 check 이름·exit code를 출력한다. (Claude Code Stop hook 계약: exit 2에서 stdout은 파싱되지 않고 stderr가 모델 피드백이 된다. allow는 exit 0 + 빈 stdout — `decision:"allow"` JSON은 Claude Code 출력 스키마(zod, decision enum `approve|block`)에 걸려 검증 실패한다.)
 * 실패 로그는 `.claude/state/eghs/verify-logs/<sid>/<name>.log`에 저장(stdout+stderr 합쳐서). 성공 실행도 동일 경로에 저장해 metric 측정/디버깅에 활용.
 
 **Recursion 방지**:
@@ -568,7 +642,6 @@ False-positive escape는 **인프라성 오류**에만 적용한다.
 Auto-unblock 허용(R3 enum의 `Auto-unblock: Yes`):
 
 * `INPUT_PARSE`
-* `NO_SESSION`
 * `SCHEMA_NOT_INITIALIZED`
 * `FS_INFO_MISSING`
 * `MIGRATE_IN_PROGRESS`
@@ -584,6 +657,7 @@ Auto-unblock 금지(R3 enum의 `Auto-unblock: No`):
 * `SCHEMA_MISMATCH`
 * `INFRA_NOT_READY`
 * `SID_COLLISION`
+* `NO_SESSION`
 * Stop verification failure
 
 즉, evidence 부족이나 SHA mismatch는 자동으로 우회하지 않는다.
@@ -592,26 +666,77 @@ Auto-unblock 금지(R3 enum의 `Auto-unblock: No`):
 
 각 hook 진입 직후 다음 순서로 평가한다. 먼저 매칭되는 조건이 이긴다. **Hook 종류별 분기 포함**.
 
-**중요한 invariant**: precedence #1~#3은 **state mutation 절대 금지**(stat/env 검사만). state mutation은 #4 이후에만 발생. kill switch/CI passthrough가 set이면 mutation 절차에 진입조차 안 한다. 이는 G5 ("즉시 비활성화 가능") + §R6 "kill switch 환경에서 disk leak 없음" 보장의 단일 근거.
+**중요한 invariant**: precedence **#1~#3.7** (schema stat + kill switch + CI passthrough + flock capability 검증 + NO_SESSION validation + sid tombstone) 은 **state mutation 절대 금지**(stat/env/parse만). state mutation은 #4 이후에만 발생. kill switch/CI passthrough가 set이면 mutation 절차에 진입조차 안 한다. 이는 G5 ("즉시 비활성화 가능") + §R6 "kill switch 환경에서 disk leak 없음" 보장의 단일 근거. **순서**: schema stat(#1) → kill switch(#2, G5 최우선) → CI passthrough(#3) → flock 검증(#3.3) → NO_SESSION(#3.5) → sid tombstone(#3.7). kill switch는 fs-info 손상 시에도 반드시 우선 통과.
 
-0. **NO_SESSION strict validation (mutation 없음)**: hook input JSON을 파싱해 `session_id` 필드를 strict UUIDv4 regex(R3)로 검증한다. 위반 또는 부재 시 hook 종류별 분기:
-    * `PreToolUse Read`: state write 없음. `decision: "allow"` (R3 NO_SESSION 정의). debug log 없음(sid 없음). exit 0.
-    * `PreToolUse Write/Edit/MultiEdit`: 동일하게 `decision: "allow"` gate skip. state write 없음. exit 0. (모델 우회 방지: kill switch/config로 대응, 본 단계에서는 차단 안 함 — sid 없는 hook 요청은 Claude Code infra 이상 신호이지 사용자 편집 행위가 아니므로 fail-soft.)
-    * `PostToolUse Write/Edit/MultiEdit/Read`: 즉시 short-circuit. state write/marker/pre 조회 모두 skip. exit 0 (R4 NO_SESSION 단락 참조).
-    * `UserPromptSubmit`: additionalContext 없음, normal exit 0 (R1 fail-soft).
-    * `Stop`: block, `deny_code: NO_SESSION`, auto-unblock=No (G3 보장: verification 실행 안 했으므로 자동 통과 금지). Claude Code가 sid 재발급 후 재시도해야 함.
-    본 단계는 stat/parse만 수행하며 어떤 state file도 만들지 않는다(sid 없이는 저장 위치 자체가 정의 안 됨). 이 검사 후에야 #1이 시작된다.
 1. **on-disk schema_version 읽기 (stat-only, mutation 없음)**: `.claude/state/eghs/schema_version`을 stat. mkdir/생성하지 않음.
     * 파일 부재 또는 state dir `ENOENT` → `disk_schema = null` (NOT_INITIALIZED 신호).
     * regular file이 아닌 비정상(디렉토리/symlink 끊김/소켓/FIFO 등) → `disk_schema = INVALID`.
     * regular file이지만 size > 32 bytes → `disk_schema = INVALID`(읽지 않음).
     * regular file이고 size ≤ 32 bytes → 읽어서 **strict 검증**: 정확히 정규식 `^[1-9][0-9]*\n$` 매칭이어야 한다(BOM 금지, 선행 0 금지, 선행/후행 공백 금지, 추가 개행 금지, NUL 금지). 모든 위반 → `disk_schema = INVALID`. 매칭 성공 시 정수 부분만 파싱해 `disk_schema = <int>`.
     * `disk_schema == INVALID`는 NOT_INITIALIZED와 **명확히 구분**(아래 #7 분류 참조). INVALID은 fail-OPEN을 절대 허용하지 않는다.
-2. **Kill switch** (stat/env 검사만, mutation 없음): `.claude/eghs-off` regular file 또는 `EGHS_DISABLED=1`이면 즉시 exit 0. 모델 우회 risk는 §3 non-goal로 명시. stderr에 `[eghs] kill-switch active: <reason>` 1줄 로그 외 어떤 disk write도 없음.
+2. **Kill switch** (stat/env 검사만, mutation 없음): `.claude/eghs-off` regular file 또는 `EGHS_DISABLED=1`이면 즉시 exit 0. 모델 우회 risk는 §3 non-goal로 명시. stderr에 `[eghs] kill-switch active: <reason>` 1줄 로그 외 어떤 disk write도 없음. **G5 즉시 비활성화 보장**: kill switch는 fs-info.json corruption과 무관하게 반드시 통과되어야 하므로 #1.5 fs-info 검증보다 **앞선다**.
 3. **CI passthrough** (env 검사만, mutation 없음): Stop hook을 제외한 hook에서만 적용. `CI=true/1`, `GITHUB_ACTIONS=true`, `GITLAB_CI=true`, `BUILDKITE=true` 중 매칭 시 exit 0. Stop은 G3 보장을 위해 CI에서도 verification을 강제하므로 본 단계를 건너뛴다.
+3.3. **fs-info.json flock capability 검증 (stat + read only, mutation 없음)** — R2.5 eghs-init step 6 flock probe로 캐시된 값을 hook이 신뢰하기 전에 검증. kill switch(#2)/CI passthrough(#3) 통과 후에만 도달. **#1에서 결정된 `disk_schema`를 사용**: `disk_schema == null` 이면 부트스트랩 전이므로 본 단계 skip → 다음 단계 fall-through(#7에서 NOT_INITIALIZED 분기). `disk_schema != null` (INVALID 포함) 이면 다음을 수행:
+    * `fs-info.json` 부재 → `FS_INFO_MISSING` 후보 (#4/#7 분기에서 처리).
+    * `fs-info.json` 파일 존재하지만 **regular file 아님/size > 4KB/JSON parse 실패/필수 필드(`schema_version`, `caseless_fs`, `flock_ok`, `fs_st_dev`, `fs_statfs_id`) 중 하나라도 누락 또는 type 불일치** → `INFRA_NOT_READY reason=infra_not_ready`, stderr `[eghs] fs-info.json corrupt; run: eghs-init --repair` 안내(legacy cache 및 partial-write 회복 경로 통합).
+    * 읽기 성공하지만 `flock_ok !== true` → `INFRA_NOT_READY reason=infra_not_ready` 반환, stderr `run: eghs-init --repair`.
+    * `flock_ok === true` 이지만 현재 state root `st_dev` + platform-normalized FS type identifier가 cache의 `fs_st_dev`/`fs_statfs_id`와 불일치 → **FS 이동 감지**, `INFRA_NOT_READY reason=infra_not_ready` 반환, stderr `run: eghs-init --repair to re-probe FS`.
+    * 모두 정상 → 다음 단계. **이 검증 없이 #3.7 flock에 의존하면 broken-NFS legacy cache에서 silent no-op flock 통과 → guard/tombstone 무력화**.
+
+3.5. **NO_SESSION strict validation (mutation 없음, #2 kill switch와 #3 CI passthrough 뒤에서만 도달)**: hook input JSON을 파싱해 `session_id` 필드를 strict UUIDv4 regex(R3 §)로 검증. 위반 또는 부재 시 hook 종류별 분기 — **`PreToolUse Write/Edit/MultiEdit` 및 `PreToolUse Read`는 fail-closed** (G1 Read-before-Edit는 sid 없이는 원천 검증 불가):
+    * `PreToolUse Write/Edit/MultiEdit`: **block, `deny_code: NO_SESSION`, auto-unblock=No.** state write 없음. Claude Code sid 발급 로직 이상 신호 → 사용자에게 stderr 안내(session_id 재발급 후 재시도). 모델이 sid 삭제로 gate 우회하는 시나리오도 본 fail-closed로 방어.
+    * `PreToolUse Read`: **block, `deny_code: NO_SESSION`, auto-unblock=No.** Read evidence가 저장될 sid 위치 자체가 없어 후속 Write/Edit이 어차피 `UNREAD_OR_STALE`로 실패 → fail-fast가 정답.
+    * `PostToolUse Write/Edit/MultiEdit/Read`: 즉시 short-circuit. state write/marker/pre 조회 skip. exit 0(R4 NO_SESSION 단락).
+    * `UserPromptSubmit`: additionalContext 없음, normal exit 0(R1 fail-soft, 사용자 입력 차단 금지).
+    * `Stop`: block, `deny_code: NO_SESSION`, auto-unblock=No(G3: verification 실행 안 했으므로 자동 통과 금지).
+    본 단계는 stat/parse만 수행(어떤 state file도 만들지 않음, debug log도 없음 — sid 없어 `debug/<sid>.jsonl` 경로 미정). 관측은 stderr 1줄(`[eghs] NO_SESSION: <hook_type>`)만 허용. 본 검사 후에야 #3.7이 시작된다. **kill switch/CI passthrough가 앞선 #2/#3에서 이미 exit 0시켰다면 본 단계는 도달 불가** — 즉 kill switch가 NO_SESSION보다 무조건 우선.
+
+3.7. **Sid tombstone check + shared guard acquire (POSIX `flock(2)` 커널 rwlock으로 race 완전 close)**:
+
+    이전 세대의 "stat 후 mutation 직전 재확인" 방식은 stat→mutation 사이 race를 못 닫는다. 커널 lock으로 대체.
+
+    **파일 정의**:
+      * `sessions/<sid>.guard.lock` (empty regular file, 0600 권한). 존재 자체가 sid mutation 활동 중 signal. lifetime = sid 활동 개시 첫 hook의 #3.7 create ~ `--clear-sid` cascade unlink.
+      * `sessions/<sid>.tombstone` (JSON body `{cleared_by_pid, cleared_by_uid, ts_ms, reason}`; link(2) exclusive create). 존재 = sid 삭제 진행/완료.
+
+    **Hook 절차 (#3.7)**:
+      **0. Precondition — `disk_schema == null` (NOT_INITIALIZED) fast-path**: #1에서 `disk_schema=null` 이면 state dir 자체 부재 → 활성 sid state가 존재할 수 없다 → guard 획득 skip, tombstone stat skip, 즉시 #4로 fall-through (#7에서 최종 `SCHEMA_NOT_INITIALIZED` 분기 처리). guard.lock create시도 자체가 clean-install 시나리오에서 ENOENT crash 유발하므로 필수 skip.
+      1. `sessions/<sid>.tombstone` stat. 존재 시 즉시 `INFRA_NOT_READY reason=sid_cleared` 반환 (mutation-free short-circuit; guard 획득 시도 안 함).
+      2. `open("sessions/<sid>.guard.lock", O_RDWR|O_CREAT|O_CLOEXEC, 0600)` → guard fd 확보.
+         - **ENOENT** (parent `sessions/` 자체 부재; `disk_schema != null`인데 subdir 수동 삭제된 상태) → 즉시 `INFRA_NOT_READY reason=infra_not_ready` 반환, stderr `run: eghs-init --repair` 안내. mutation-free skip.
+         - **EACCES/기타** → 즉시 `INFRA_NOT_READY reason=infra_not_ready` 반환.
+         - 파일 부재 시 생성됨(**이 create는 mutation invariant 예외로 허용 — kill switch(#2)와 NO_SESSION(#3.5) 통과 후이므로 kill-switch 환경 disk-leak 없음, G5 유지**; CI passthrough(#3)은 Stop 제외이므로 CI 환경 Stop만 예외적으로 guard 생성 → 정상 session lifecycle 하 § R6 #5b cascade GC로 회수).
+      3. `flock(fd, LOCK_SH|LOCK_NB)` 시도.
+         - EWOULDBLOCK → `--clear-sid`가 이미 exclusive 대기/획득 중. 즉시 fd close + `INFRA_NOT_READY reason=sid_cleared` 반환.
+         - 성공 → shared 획득.
+      4. **shared 획득 직후 tombstone stat 재확인** (race window: 다른 process가 step 1과 step 3 사이에 tombstone create).
+         - 존재 → shared 해제(fd close) + `INFRA_NOT_READY reason=sid_cleared` 반환.
+         - 부재 → 진행.
+      5. hook lifecycle 전체(precedence #4-#8 + 모든 state mutation)를 이 shared hold 상태로 수행.
+      6. hook exit 시 fd close (커널이 flock 자동 해제).
+
+    **`--clear-sid` 절차 (§R2.5 step 5 → 6)**:
+      * step 5a: `sessions/<sid>.tombstone` link(2) exclusive create. EEXIST 시 **기존 tombstone owner 검증** (아래 "재개 절차" 참조).
+      * step 5c: `open("sessions/<sid>.guard.lock", O_RDWR|O_CREAT|O_CLOEXEC, 0600)` + `flock(fd, LOCK_EX)` (blocking, timeout `wait_grace_ms=90000ms`).
+        - 성공 → 진행. 이 시점 모든 활성 hook은 이미 종료 완료.
+        - timeout → hook drain 지연 이례적. abort(stderr `hooks did not drain within grace`; 재시도 안내). tombstone은 잔존 → 다음 hook은 여전히 sid_cleared로 block, disk consistency 손상 없음.
+      * step 6: cascade delete (guard.lock unlink 포함).
+
+    **`--clear-sid` 재개 절차 (BLOCKER — 중단된 clear-sid 회복 경로)**:
+      * step 5a EEXIST 시 tombstone body 확인 → `cleared_by_uid != 현재 uid` → abort(foreign lock).
+      * `cleared_by_uid == 현재 uid`:
+        - `kill(cleared_by_pid, 0)` 성공(alive) → **다른 --clear-sid 진행 중** → abort(stderr `another --clear-sid running`).
+        - ESRCH(dead) → **owner crash**. tombstone identity(inode + body sha256) snapshot 후 step 5c로 진행. 즉 기존 tombstone을 barrier로 재활용해 cascade 재개(자동 sweep 3600s 대기 불필요).
+        - same-uid EPERM → 보수적으로 alive 취급 abort.
+
+    **원자성 보장**: shared holder 존재 중에는 exclusive blocked. shared holder들의 모든 state-dir mutation(pre/, sessions/, baselines/, failed/ key-scoped, failed/ sid-scoped, verify-logs/, debug/, locks/stop-*, reads/ cross-session)이 --clear-sid cascade와 완전 배타. per-mutation re-stat 열거 삭제, **단일 규칙: "모든 sid-scoped state-dir mutation은 shared guard hold 상태에서만 수행"**.
+
+    **flock 특성**: 프로세스 종료 시 커널 자동 해제 → dangling risk 없음. `flock(LOCK_NB)` fast path syscall ~1μs, §R5 hook budget(p95 100ms) 침해 없음.
+
+    본 단계는 mutation-free invariant에서 유일한 예외(guard.lock create): kill switch(#2)와 NO_SESSION(#3.5) 통과 후에만 create이 발생하므로 kill-switch/no-sid 환경에서 disk write 없음(G5 유지). CI passthrough(#3)는 Stop hook 제외 규칙(§CI passthrough)에 따라 CI 환경 Stop만 예외적으로 #3.7 진입 — 이 경우 guard.lock은 정상 sid lifecycle에 종속되어 §R6 #5b sessions cascade GC로 회수(cascade 목록에 guard.lock 포함).
 4. **migrate.lock 체크 (state mutation 가능: stale lock 삭제)**: `.claude/state/eghs/migrate.lock` stat 후 다음 분기. 본 단계가 반환하는 모든 deny code는 **hook 종류별 재분류 매트릭스**(아래 표)를 통과한 결과를 반환한다.
     * 부재 → 다음 단계.
-    * regular file이고 lock content 파싱 실패(open ENOENT race, JSON 깨짐 등) → 본 결정 보류, retry 1회 후 여전히 실패면 hook-type 매트릭스로 `INFRA_NOT_READY` 반환.
+    * regular file이고 lock content 파싱 실패(open ENOENT race, JSON 깨짐 등) → 본 결정 보류, retry 1회 후 여전히 실패면 hook-type 매트릭스로 `INFRA_NOT_READY` 반환. **PostToolUse Write/Edit/MultiEdit의 marker `reason=migrate_lock_corrupt`로 표기**(원 root cause 보존; user에게 `--clear-migrate-lock` 안내).
     * regular file이고 lock content의 `uid` == 현재 hook uid이며 `kill(pid,0)` 성공 → 후보 `MIGRATE_IN_PROGRESS`.
     * regular file이고 same uid이지만 `kill(pid,0)` EPERM(PID namespace/sandbox 등 비정상) → 후보 `MIGRATE_IN_PROGRESS`(liveness 판정 불가, fail-closed).
     * regular file이지만 `uid` != 현재 hook uid:
@@ -619,7 +744,7 @@ Auto-unblock 금지(R3 enum의 `Auto-unblock: No`):
         * grace 경과면 foreign-stale 추정 → 후보 `INFRA_NOT_READY`. stderr에 `eghs-migrate --force-foreign-cleanup` 실행 안내. 자동 삭제는 권한 risk로 인해 수행하지 않음.
     * regular file이고 same uid + `kill(pid,0)` ESRCH(dead) + `start_ms + migrate_lock_grace_ms`(기본 600s) 경과 → stale 판정, 삭제 후 다음 단계.
     * regular file이지만 same uid + dead + grace 미경과 → 후보 `MIGRATE_IN_PROGRESS`(짧은 crash 직후 보호 기간).
-    * regular file이 아닌 비정상 type → 후보 `INFRA_NOT_READY`(인프라 결함). `FILE_UNREADABLE` 아님(자동 우회 금지).
+    * regular file이 아닌 비정상 type → 후보 `INFRA_NOT_READY`(인프라 결함). `FILE_UNREADABLE` 아님(자동 우회 금지). **PostToolUse marker `reason=migrate_lock_corrupt`로 표기** (파일형 corrupt).
 
     **Hook-type 재분류 매트릭스**(후보 → 실제 반환): G3/R1 보장을 위해 hook별로 결과를 다르게 분류한다.
 
@@ -627,7 +752,7 @@ Auto-unblock 금지(R3 enum의 `Auto-unblock: No`):
     | --- | --- | --- | --- |
     | `UserPromptSubmit` | stderr warning + additionalContext "migrate in progress" 1줄 + **normal exit 0** (R1 fail-soft, 사용자 입력 차단 금지) | 동일하게 fail-soft normal exit | 동일하게 fail-soft normal exit + additionalContext "sid collision detected, check Claude Code sid uniqueness" |
     | `Stop` | **block, auto-unblock=No** (G3: verification 실행 안 했으므로 자동 통과 금지). deny_code는 `INFRA_NOT_READY` (auto-unblock=No)로 마스킹해 반환. 원본 후보는 debug log에만 기록. | block, auto-unblock=No | block `SID_COLLISION`, auto-unblock=No |
-    | `PostToolUse Write/Edit/MultiEdit` | **fail-closed marker 기록 후 exit 0**: 현재 sid의 sid-scoped marker `failed/<sid>/<sha1(key)>.json`을 `reason=migrate_in_progress`로 atomic 작성(가능하면; state dir write 권한 없으면 best-effort), `pre/<sid>/<key>.write.json`은 unlink. 후속 PreToolUse가 `STATE_RECORD_FAILED`로 정확한 root cause 차단. | 동일 처리(`reason=infra_not_ready`). | 동일 처리(`reason=sid_collision`). |
+    | `PostToolUse Write/Edit/MultiEdit` | **fail-closed marker 기록 후 exit 0**: 현재 sid의 sid-scoped marker `failed/<sid>/<sha1(key)>.json`을 `reason=migrate_in_progress`로 atomic 작성(가능하면; state dir write 권한 없으면 best-effort), `pre/<sid>/<sha1(key)>.<tool_use_id>.write.json`은 unlink. 후속 PreToolUse가 `STATE_RECORD_FAILED`로 정확한 root cause 차단. | 동일 처리(`reason=infra_not_ready`). | 동일 처리(`reason=sid_collision`). |
     | `PostToolUse Read` | state write skip, exit 0 (read-only fallback). | 동일. | 동일. |
     | `PreToolUse Write/Edit/MultiEdit` | block `MIGRATE_IN_PROGRESS` (auto-unblock=Yes). 본인이 만든 pre file 즉시 unlink. | block `INFRA_NOT_READY` (auto-unblock=No). | block `SID_COLLISION` (auto-unblock=No). pre file 즉시 unlink. |
     | `PreToolUse Read` | block `MIGRATE_IN_PROGRESS` (auto-unblock=Yes). pre file unlink. | block `INFRA_NOT_READY` (auto-unblock=No). | block `SID_COLLISION` (auto-unblock=No). pre file unlink. |
@@ -635,7 +760,15 @@ Auto-unblock 금지(R3 enum의 `Auto-unblock: No`):
     위 매트릭스는 동일하게 precedence **#6 lease 작성 실패(EEXIST 제외)** 시에도 적용된다(중복 명세 제거를 위해 본 표를 참조).
 5. **recover.lock GC + sessions/ GC + state subdir 검증** (state mutation): kill switch와 CI passthrough를 통과한 후에만 진입.
     a. **recover.lock GC**: state dir 존재 시 `locks/` 디렉토리를 1회 scan해 자기 uid 소유의 stale recover.lock(`kill(pid,0)` ESRCH + `start_ms + recovery_grace_ms` 경과)을 best-effort unlink. foreign-uid는 건드리지 않음.
-    b. **sessions/ GC** (R2.5 정책): `sessions/<sid>.json` 중 (renewed_ms stale + same uid + pid dead) 조건 만족하는 lease를 unlink. 각 GC sid에 대해 cascade delete(baselines/<sid>.txt + verify-logs/<sid>/ + debug/<sid>.jsonl + pre/<sid>/ + failed/<sid>/ + **locks/stop-<sid>.lock + locks/stop-<sid>.recover.lock**). best-effort, ENOENT/EPERM 둘 다 silently skip(orphan은 다음 GC pass에서 표면화). stop-lock 포함 이유: mid-Stop crash 후 sessions GC 하나로 cleanup 완료(UUIDv4 sid 재사용 없음 → 자체 stale rule로는 절대 회수 안 됨).
+    b. **sessions/ GC** (R2.5 정책): `sessions/<sid>.json` 중 (renewed_ms stale + same uid + pid dead) 조건 만족하는 lease를 GC 후보로 식별. **처리 순서 (원자성 아니지만 재시도 가능성 보존)**:
+        1. **cascade delete 먼저 (lease 유지 상태에서)**: 각 target을 아래 semantics로 처리 — 파일은 `unlink`, 디렉토리는 **재귀 삭제**(entries 모두 unlink 후 rmdir): `baselines/<sid>.txt`(파일) + `verify-logs/<sid>/`(**재귀**) + `debug/<sid>.jsonl`(파일) + `pre/<sid>/`(**재귀**) + `failed/<sid>/`(**재귀**) + `locks/stop-<sid>.lock`(파일) + `locks/stop-<sid>.recover.lock`(파일) + **`sessions/<sid>.guard.lock`(파일; lease 이전 unlink 필수)** + **`sessions/<sid>.tombstone`(파일)** (crash 남긴 tombstone 회수 목적, --clear-sid 진행 중이면 tombstone 자체가 존재 신호 → 본 GC 진입 안 됨). 모두 best-effort. 재귀 삭제 실패 시(entry EPERM/EACCES) 해당 dir 자체 실패로 취급 → 아래 결과 분류 진입.
+        2. **결과 분류**:
+           - 모두 성공(ENOENT 포함) → 최종 단계로 진행.
+           - EPERM/EACCES 등 진짜 실패 발생 → **lease 유지**(unlink 금지). 다음 GC pass에서 재시도할 수 있도록 sid를 GC candidate 상태로 남긴다(sid-scoped marker의 유일 GC 경로가 sessions cascade이므로 lease 선삭제 시 orphan 영구화). debug log에 `event: "sessions_gc_partial"` + `{sid, failed_targets: [...]}` 기록.
+        3. **최종: cascade 성공 시에만 lease unlink**: `sessions/<sid>.json`을 best-effort unlink. 이 시점 실패는 다음 pass에서 자연 회수.
+        stop-lock 포함 이유: mid-Stop crash 후 sessions GC 하나로 cleanup 완료(UUIDv4 sid 재사용 없음 → 자체 stale rule로는 절대 회수 안 됨).
+        **본 단계는 pre/ 디렉토리의 24h 초과 파일 GC도 함께 수행**(정책은 R2.5 pre/<sid>/ 정의 참조). "hook 시작 시 자동 GC" 표현은 legacy — 실제 GC는 오직 이 #5b에서만 발생(G5 invariant 준수).
+        **orphan tombstone sweep** (crash-safe): `sessions/*.tombstone` 중 sibling `sessions/<sid>.json` 및 sibling 모든 cascade target(baselines/verify-logs/debug/pre/failed/locks stop-*)이 모두 부재이고 tombstone body `ts_ms + tombstone_stale_seconds`(기본 3600s) 경과인 파일을 best-effort unlink. --clear-sid crash로 leaked된 tombstone이 disk에 축적되는 것을 방지(G5 disk-leak-free 유지). 같은 uid 소유만 대상, foreign-uid tombstone은 건드리지 않음.
     c. **state subdir 검증**: subdir(`tmp/`, reads/, reads/tmp/, failed/, failed/tmp/, pre/, locks/, locks/tmp/, sessions/, sessions/tmp/, baselines/, baselines/tmp/, verify-logs/, debug/) 중 하나라도 부재면 다음 분기:
        * **`disk_schema == null` (state dir 자체 부재 또는 schema_version 부재)**: clean-install 시나리오로 판정 → 본 단계 검사 skip, #7 `NOT_INITIALIZED` 분기로 위임(`eghs-init` 실행 안내). subdir-only-missing과 분리 처리해 부트스트랩 봉쇄 방지.
        * **`disk_schema == hook_version` (정상 schema + subdir만 일부 부재)**: 부분 초기화/수동 삭제 회복 시나리오 → **`INFRA_NOT_READY`** 후보로 #4 매트릭스 적용. remediation은 `eghs-init --repair` (아래 §R2.5 eghs-init --repair 정의 참조).
@@ -654,13 +787,24 @@ Auto-unblock 금지(R3 enum의 `Auto-unblock: No`):
                1. **anchor 일치 AND sessions.pid == current claude-code-pid** (anchor `lease_start_ms == sessions.start_ms` AND `lease_pid == sessions.pid` AND `sessions.pid == current_pid`) → **reuse OK**, 정상 종료. pid 동일성 검사는 foreign-pid가 살아있고 anchor도 우연 일치하는 SID_COLLISION 미감지 방지(G1 보호).
                2. **anchor 일치 AND sessions.pid != current_pid AND sessions.pid alive** (`kill(sessions.pid, 0)` 성공 or **same-uid EPERM**(PID namespace/sandbox 비정상)) → **6.3c SID_COLLISION 분기**. fail-closed.
                3. **anchor 불일치 AND sessions.pid alive** (`kill(sessions.pid, 0)` 성공 or same-uid EPERM) → **6.3c SID_COLLISION 분기**. 본 stale-cleanup 절대 실행 금지(살아있는 lease 침해 금지).
-               4. **sessions/<sid>.json 부재** OR **anchor 불일치 AND lease pid dead(ESRCH)** OR **anchor 일치 AND lease pid dead(ESRCH)** OR **baseline JSON parse 실패** → **stale-cleanup 분기**(절차 i–iv):
-                  i. `sessions/<sid>.json` 잔존 시 read하여 기존 `start_ms`(`prior_start_ms`)와 기존 본문 전체를 임시 보존. 그 후 unlink(stale lease가 renew로 ressuscitate되지 않게).
-                  ii. baselines/<sid>.txt + verify-logs/<sid>/ + debug/<sid>.jsonl + pre/<sid>/ unlink + failed/<sid>/ unlink + **locks/stop-<sid>.lock + locks/stop-<sid>.recover.lock** unlink + **failed/<sha1(*)>.json key-scoped marker 중 origin_sid == `<현 cleanup 대상 sid (파일명)>`인 것 unlink** (전체 `failed/` 디렉토리 scan; expensive하지만 race 안전 위해 필수). 모두 best-effort. **ii의 결과 분기**:
-                     * 모두 성공 또는 ENOENT만 발생 → step iii에서 `prior_start_ms` 보존 가능.
-                     * EPERM 등 진짜 실패가 1건이라도 발생 → key-scoped foreign marker가 잔존 가능성 있음. step iii에서 `prior_start_ms` 사용 금지, **fallback `start_ms = max(now_ms, prior_start_ms + 1)`** 사용 (시스템 clock backward jump — NTP correction, VM restore 등 — 발생 시에도 잔존 marker `ts_ms`가 새 `start_ms`보다 무조건 이전이 되도록 clamp; 순수 `now_ms`만 쓰면 clock 역행 시 marker sticky 지속). 본 분기 진입 시 debug log에 `event: "eperm_start_ms_fallback"` + `{prior_start_ms, now_ms, chosen_start_ms}` 1줄 기록(diagnostic trail).
-                  iii. lease 재작성: sessions/<sid>.json `O_CREAT|O_EXCL` create with `{pid: current claude-code-pid, uid, start_ms: <ii 분기 결정>, renewed_ms: now_ms}`. EEXIST면 다른 hook이 동시 재생성 → 그 lease body의 pid를 stat → current_pid와 일치하면 renew 분기, 다른 pid alive(or same-uid EPERM)면 SID_COLLISION, 다른 pid dead면 본 b 재진입(1회 retry, 그래도 실패 시 후보 `INFRA_NOT_READY` → #4 매트릭스).
-                  iv. #6.3a baseline 작성(link(2) exclusive) 1회 재시도. 실패 시 후보 `INFRA_NOT_READY` → #4 매트릭스.
+               4. **sessions/<sid>.json 부재** OR **anchor 불일치 AND lease pid dead(ESRCH)** OR **anchor 일치 AND lease pid dead(ESRCH)** OR **(baseline JSON parse 실패 AND sessions.pid dead(ESRCH))** → **stale-cleanup 분기**(절차 i–vi). **baseline parse 실패 AND sessions.pid alive는 여기 진입 금지**: 살아있는 lease cascade-unlink 시 concurrent Stop verification/other hook 침해. 이 조합은 아래 5/6번 분기로 분류.
+               5. **baseline JSON parse 실패 AND sessions.pid == current_pid alive** → **후보 `INFRA_NOT_READY`** (#4 매트릭스 적용, `PostToolUse Write/Edit/MultiEdit`의 marker `reason=lease_unavailable`). 자기 자신의 lease + 자기 baseline 손상이므로 SID_COLLISION 아님(다른 세션 존재 신호 없음). lease/baseline **절대 unlink 금지**(살아있는 lease 침해 금지). **remediation: `eghs-migrate --clear-sid <SID> --force`** 실행(현 세션 종료 후 또는 `--force` 승인). `eghs-init --repair`는 baselines/를 건드리지 않으므로 자동 회복 불가.
+               6. **baseline JSON parse 실패 AND sessions.pid != current_pid AND sessions.pid alive(or same-uid EPERM)** → **6.3c SID_COLLISION 분기**(fail-closed). live foreign lease 침해 절대 금지. 사용자가 `eghs-migrate` 또는 세션 종료 후 재시도.
+
+               **stale-cleanup 절차 (4번 분기에만 도달)**:
+                  **precondition validation** (destructive 절차 진입 전 필수):
+                     * `sessions/<sid>.json` 잔존 시 body를 read해 `prior_start_ms`를 파싱한다(이 시점에 unlink는 아직 하지 않는다). `prior_start_ms` **부재/parse 실패/음수/> `2^53-1`/> `now_ms + far_future_grace_ms`**(기본 `far_future_grace_ms=86400000` = 24h) 중 하나라도 해당하면 **corrupt lease 판정 → 후보 `INFRA_NOT_READY`로 즉시 반환**(#4 매트릭스 적용, marker `reason=lease_unavailable`). 이 경우 **lease/cascade unlink 절대 금지** — 손상된 sid에 대해 sid-scoped marker를 만들면 lease가 이미 없어 GC 경로가 사라지므로 orphan 영구화 위험. **remediation: `eghs-migrate --clear-sid <SID>`** 실행(R2.5 정의 참조). 일반 `eghs-migrate`/`eghs-init --repair`는 활성 lease 존재 sid를 건드리지 않으므로 자동 회복 불가 — `--clear-sid`가 유일 escape hatch.
+                     * sessions 부재 case(lease 자체가 없어 `prior_start_ms` 개념 없음)는 이 검사 skip → `start_ms = now_ms`로 lease 신규 생성.
+                  precondition 통과 후 아래 i, iii–vi 실행 (ii는 reserved skip-note, 아래 참조):
+                  i. cascade delete 먼저(lease 유지 상태에서 — #5b GC 원칙과 동일): `baselines/<sid>.txt` unlink + `verify-logs/<sid>/` **재귀 삭제**(rm -rf semantics: entries 먼저 unlink 후 rmdir) + `debug/<sid>.jsonl` unlink + `pre/<sid>/` **재귀 삭제** + `failed/<sid>/` **재귀 삭제** + `locks/stop-<sid>.lock` unlink + `locks/stop-<sid>.recover.lock` unlink + **failed/<sha1(*)>.json key-scoped marker 중 origin_sid == 현 sid인 것** unlink(전체 `failed/` scan). 모두 best-effort.
+                  ii. **[reserved skip-note; DO NOT IMPLEMENT]**: R16 senior#2 fix로 sanity validation이 precondition으로 hoist되어 이 자리는 no-op. 번호 유지 이유는 후속 iii-vi의 기존 문서 참조 안정성 보존.
+                  iii. **`start_ms` 결정**:
+                     * **sessions 부재였던 case (prior_start_ms 없음)**: cascade 결과와 무관하게 항상 `start_ms = now_ms`. 이 case에는 fallback clamp 공식 적용 불가(prior_start_ms 없음).
+                     * **sessions 존재 case, cascade 모두 성공 또는 ENOENT만 발생**: `start_ms = prior_start_ms`.
+                     * **sessions 존재 case, EPERM/EACCES 등 진짜 실패 1건이라도 발생**: key-scoped foreign marker 잔존 가능성. fallback `start_ms = max(now_ms, prior_start_ms + 1)` 사용(clock skew clamp). debug log에 `event: "eperm_start_ms_fallback"` + `{prior_start_ms, now_ms, chosen_start_ms}` 1줄 기록.
+                  iv. **stale lease unlink**: 이 시점에 `sessions/<sid>.json` unlink(precondition + cascade 완료 후 안전). ENOENT면 이미 GC됨(계속 진행).
+                  v. **lease 재작성**: **normal create branch(#6.3.1)와 동일한 link(2) exclusive 절차 사용** (atomic-write contract §R2.5 준수, 직접 create 금지 — concurrent reader가 empty/partial JSON 관측 방지): body `{schema_version, pid: current claude-code-pid, uid, start_ms: <iii 분기 결정>, renewed_ms: now_ms}`를 `sessions/tmp/<sid>.<pid>.<seq>`에 fsync 후 `link(2)`로 `sessions/<sid>.json`에 이동. EEXIST면 다른 hook이 동시 재생성 → tmp unlink → 그 lease body의 pid를 stat → current_pid와 일치하면 renew 분기, 다른 pid alive(or same-uid EPERM)면 SID_COLLISION, 다른 pid dead면 본 b 재진입(1회 retry, 그래도 실패 시 후보 `INFRA_NOT_READY` → #4 매트릭스).
+                  vi. **#6.3a baseline 작성**(link(2) exclusive) 1회 재시도. 실패 시 후보 `INFRA_NOT_READY` → #4 매트릭스.
             c. **SID_COLLISION 분기** (b의 결정 트리에서만 도달): 후보 `SID_COLLISION` → #4 hook-type 매트릭스의 SID_COLLISION 컬럼 적용. sessions/<sid>.json 절대 unlink 금지. 디버그 로그에 collision detail(현 pid, foreign pid, start_ms들) 기록.
     4. `disk_schema_now`가 `null` / `INVALID` / mismatch이면 lease 기록 skip하고 다음 단계로 진행(다음 단계에서 hook 종류별로 분기).
     5. lease/baseline 작성 실패 처리:
@@ -684,7 +828,7 @@ Auto-unblock 금지(R3 enum의 `Auto-unblock: No`):
        * 어떤 분기에서도 fallback Stop은 `mkdir -p`로 state dir을 생성하지 않는다(`eghs-init`이 명시적 부트스트랩).
    * `PostToolUse Write/Edit/MultiEdit`:
        * NOT_INITIALIZED/MISMATCH/FS_INFO_MISSING: state write skip하고 exit 0 (fail-soft. 이 경로에서는 후속 PreToolUse가 동일 상태로 차단되므로 second-line 방어가 동작).
-       * **INVALID**: state write skip + **sid-scoped failed marker** `failed/<sid>/<sha1(key)>.json` (reason=`schema_invalid`) 기록 (R4 매트릭스와 일관, INVALID never fail-OPEN 원칙 적용). marker write 자체가 ENOENT/EPERM이면 best-effort skip. `pre/<sid>/<key>.write.json`도 unlink. INVALID 해소(`eghs-init --repair`) 후 첫 PreToolUse가 `STATE_RECORD_FAILED`로 정확한 root cause 차단.
+       * **INVALID**: state write skip + **sid-scoped failed marker** `failed/<sid>/<sha1(key)>.json` (reason=`schema_invalid`) 기록 (R4 매트릭스와 일관, INVALID never fail-OPEN 원칙 적용). marker write 자체가 ENOENT/EPERM이면 best-effort skip. `pre/<sid>/<sha1(key)>.<tool_use_id>.write.json`도 unlink. INVALID 해소(`eghs-init --repair`) 후 첫 PreToolUse가 `STATE_RECORD_FAILED`로 정확한 root cause 차단.
    * `PostToolUse Read`: 모든 상태에서 state write skip하고 exit 0(읽기 전용, fail-soft).
    * `PreToolUse Write/Edit/MultiEdit`: 상태별 deny code 반환.
        * NOT_INITIALIZED → `SCHEMA_NOT_INITIALIZED`(auto-unblock=Yes).
@@ -706,9 +850,9 @@ Auto-unblock 금지(R3 enum의 `Auto-unblock: No`):
 **Dry-run 모드 (normative)**:
 
 * MVP §8.7의 CLI interface(`<hook-script> --dry-run < input.json`)는 R6 precedence chain 실행 방식을 다음과 같이 변형한다:
-    * `--dry-run` 플래그 감지 시 **precedence #0~#3은 그대로 실행**(stat-only, mutation 없음). state mutation 단계(#4 migrate.lock stale unlink, #5 recover.lock/sessions/verify-logs GC, #6 lease/baseline write, #7의 marker write) **전체 suppress**.
+    * `--dry-run` 플래그 감지 시 **precedence #1~#3.5은 그대로 실행**(stat-only + NO_SESSION strict validation 포함, mutation 없음). **#3.7 처리**: `disk_schema == null` 이면 #3.7 step 0 fast-path와 동일하게 **tombstone stat + guard.lock 모두 skip**(would_write 미기록, 실제 hook 동작과 정확히 일치). `disk_schema != null` 이면 **tombstone stat은 그대로 수행**(stat mutation 아님), 그러나 **guard.lock create + flock 는 suppress** — 대신 "성공했다고 가정"하고 guard.lock 경로를 `would_write`에 기록. tombstone 존재 시 정상 실행처럼 `sid_cleared` 반환(dry-run 결정에 반영). state mutation 단계(#4 migrate.lock stale unlink, #5 recover.lock/sessions/verify-logs GC, #6 lease/baseline write, #7의 marker write) **전체 suppress**.
     * 결정 계산은 실제 실행과 동일 규칙 적용: mutation을 "성공했다고 가정"하고 후속 로직 진행(e.g., #6 lease write가 실제로는 안 이루어졌지만 결정 로직은 lease 있는 것처럼 계속).
-    * 후속 hook 호출을 위한 `pre/<sid>/<key>.write.json`도 dry-run에서는 생성 안 함(mutation 금지).
+    * 후속 hook 호출을 위한 `pre/<sid>/<sha1(key)>.<tool_use_id>.write.json`도 dry-run에서는 생성 안 함(mutation 금지).
     * 출력: 결정 JSON(`{decision, deny_code?, reason?, would_write: [<path>, ...]}`)을 stdout에 1줄로 출력. `would_write`는 dry-run이 아니었다면 mutation했을 파일 경로 리스트(debug/diagnostic 용도).
     * exit code: 실제 실행 시 exit code와 동일(0=allow, non-zero=block). stderr에는 어떤 mutation도 시도 안 했음을 명시(`[eghs] dry-run: no state writes performed`).
 * dry-run은 kill switch/CI passthrough 검사도 그대로 통과시킨다(#2/#3 발동 시 정상 실행과 동일하게 exit 0). 이는 CI 파이프라인에서 configuration 검증 용도.
@@ -831,15 +975,15 @@ v5 MVP는 다음을 만족하면 완료로 본다.
     * Interface: `<hook-script> --dry-run < input.json`.
     * exit code enum: `0` = allow/skip/kill_switch, `2` = block(Claude Code spec), 기타 코드는 hook 자체 crash로 간주.
     * Stop hook stdout: allow 시 빈 출력(Claude Code 스키마상 `decision:"allow"` JSON은 무효). UserPromptSubmit stdout: `hookSpecificOutput` envelope만.
-    * stderr: block 시 `[eghs] block <deny_code>: <reason>` + check별 상세 라인(exit 2에서 Claude Code가 모델에 전달하는 유일한 채널), 그 외 자유 형식 디버그 메시지. 구조화 결정 기록은 `debug/` 로그가 담당.
+    * stderr: block 시 `[eghs] block <deny_code>: <reason> sid=<sid>` + check별 상세 라인(exit 2에서 Claude Code가 모델에 전달하는 유일한 채널), 그 외 자유 형식 디버그 메시지. 구조화 결정 기록은 `debug/` 로그가 담당. `sid` 값이 없는 case(NO_SESSION deny 등)에서는 `sid=none`으로 표기(user가 `--clear-sid`용 SID 복사 가능한지 판단 가능). corrupt-lease/baseline case(`reason=lease_unavailable`)에서는 stderr 마지막에 `run: eghs-migrate --clear-sid <sid> [--force]` 안내를 추가한다.
 8. shellcheck 통과(Bash 구현 시) 또는 `tsc --noEmit` + `eslint` 통과(Node 구현 시). 구현 언어는 config 외 hook 코드 단위로 통일.
 9. `state_gate_paths`는 bash-glob(picomatch v4, `{ dot: true }`)으로 명세된다. gitignore(5) 시맨틱이 아니다 — 중첩 매칭은 `**/` 접두 필수, trailing `/` 디렉토리 한정 미지원 (§R4 매칭 문법 참조).
 10. canonical path는 case-aware `realpath`(R2 참조), SHA는 디스크 raw bytes의 SHA-256으로 통일된다. case-sensitivity는 `eghs-init`이 1회 probe해 `fs-info.json`에 캐시한다.
 11. atomic state write는 **destination-local** `tmp/` 임시 파일 + `fsync(fd)` + same-dir `rename(2)` + `fsync(dirfd)` 절차를 따르며, 임시 파일명 suffix는 per-write 단조 카운터.
 12. cross-session 정책: `reads/` 공유, gate는 `sid` 일치 요구.
 13. `pre/<sid>/`, `failed/`, `locks/`, `verify-logs/`, `reads/`, `reads/tmp/`, `failed/tmp/`, `sessions/`, `baselines/` 디렉토리의 GC/lifecycle 정책이 구현된다. `reads/`는 TTL + sid liveness 기반 GC, `sessions/`는 TTL + pid/uid liveness 기반 GC.
-14. `eghs-init` CLI가 부트스트랩(schema_version 파일, fs-info.json 생성)을 수행하고, `eghs-migrate` CLI가 schema upgrade를 처리한다(자동 삭제 금지). `eghs-migrate`는 `sessions/` 및 `locks/`가 비어 있을 때만 동작한다.
+14. `eghs-init` CLI가 부트스트랩(schema_version 파일, fs-info.json 생성 — `flock_ok`, `fs_st_dev`, `fs_statfs_id` 포함 flock capability probe 수행)을 수행하고, `eghs-migrate` CLI가 schema upgrade를 처리한다(자동 삭제 금지). `eghs-migrate`는 `sessions/` 및 `locks/`(admin-mutex.guard 제외)가 비어 있을 때만 동작한다. **`eghs-init --repair`는 R2.5 §293-297의 네 케이스(INVALID schema / subdir 부분 부재 / fs-info.json 부재 / fs-info.json unhealthy: flock_ok≠true, corrupt JSON, 필수 필드 누락, FS anchor 불일치) 모두를 idempotent하게 회복해야 한다**(FS_INFO_MISSING, subdir-missing 형 INFRA_NOT_READY, legacy-cache, FS 이동 등 self-heal 경로가 없으면 사용자가 무한 loop에 빠짐; MVP 필수).
 15. Stop hook의 `verification_parallel` 기본값은 true이며, 단일 명령 timeout 기본값 45초로 p95 90s budget을 충족한다.
 16. Kill switch는 SCHEMA_MISMATCH보다 우선 평가되고, CI passthrough는 Stop hook을 제외한 hook에만 적용된다.
-17. PostToolUse가 `pre/<posttool_sid>/<key>.write.json`을 로드하지 못하면 `STATE_RECORD_FAILED` failed marker를 남긴다. `pretool_sid == posttool_sid` invariant가 깨지면 동일 처리.
+17. PostToolUse가 `pre/<posttool_sid>/<sha1(key)>.<tool_use_id>.write.json`을 로드하지 못하면 `STATE_RECORD_FAILED` failed marker를 남긴다. `pretool_sid == posttool_sid` invariant가 깨지면 동일 처리.
 18. failed marker는 `origin_sid` + `ts_ms`로 tagged되며, 다른 세션의 marker는 현 세션 `sessions/<sid>.json`의 immutable `start_ms` 이전이어야 자동 해제된다. key-scoped와 sid-scoped marker 두 가지 경로를 모두 처리하며 sid-scoped는 cascade GC된다.
