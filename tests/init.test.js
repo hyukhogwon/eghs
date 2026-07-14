@@ -137,3 +137,182 @@ test('eghs-init refuses to run while another .init.lock is held (concurrent boot
   // schema_version must not have been written while the lock was held.
   assert.ok(!fs.existsSync(path.join(stateDir, 'schema_version')));
 });
+
+// ---- P4 unit 4: R16-R20 admin-mutex / migrate.lock / .init.lock body ----
+
+const { spawnSync, spawn } = require('child_process');
+
+function runRaw(args, cwd, env = {}) {
+  return spawnSync('node', [INIT_SCRIPT, ...args], {
+    cwd,
+    encoding: 'utf8',
+    env: { ...process.env, ...env },
+  });
+}
+
+function stateDirOf(repo) {
+  return path.join(repo, '.claude', 'state', 'eghs');
+}
+
+test('eghs-init acquires migrate.lock (role init) during the run and removes it after', () => {
+  const repo = mkTmpRepo();
+  run([], repo);
+  assert.ok(!fs.existsSync(path.join(stateDirOf(repo), 'migrate.lock')));
+  // admin-mutex.guard persists (existence is normal) but must be unlocked:
+  // an immediate --repair would deadlock if init leaked the flock.
+  assert.ok(fs.existsSync(path.join(stateDirOf(repo), 'locks', 'admin-mutex.guard')));
+  assert.equal(runRaw(['--repair'], repo).status, 0);
+});
+
+test('eghs-init aborts while another process holds a LIVE migrate.lock (same uid)', () => {
+  const repo = mkTmpRepo();
+  const stateDir = stateDirOf(repo);
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(stateDir, 'migrate.lock'),
+    JSON.stringify({ pid: process.pid, uid: process.getuid(), start_ms: Date.now(), role: 'migrate' })
+  );
+  const r = runRaw([], repo);
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /migrate\.lock/);
+  assert.ok(fs.existsSync(path.join(stateDir, 'migrate.lock')), 'live lock must survive');
+});
+
+test('eghs-init reclaims a same-uid DEAD migrate.lock past its grace and proceeds', () => {
+  const repo = mkTmpRepo();
+  const stateDir = stateDirOf(repo);
+  fs.mkdirSync(stateDir, { recursive: true });
+  const deadPid = spawnSync('node', ['-e', '']).pid;
+  fs.writeFileSync(
+    path.join(stateDir, 'migrate.lock'),
+    JSON.stringify({ pid: deadPid, uid: process.getuid(), start_ms: Date.now() - 700000, role: 'migrate' })
+  );
+  const r = runRaw([], repo);
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(!fs.existsSync(path.join(stateDir, 'migrate.lock')));
+  assert.equal(fs.readFileSync(path.join(stateDir, 'schema_version'), 'utf8'), '1\n');
+});
+
+test('eghs-init aborts on a same-uid dead migrate.lock still WITHIN its grace window', () => {
+  const repo = mkTmpRepo();
+  const stateDir = stateDirOf(repo);
+  fs.mkdirSync(stateDir, { recursive: true });
+  const deadPid = spawnSync('node', ['-e', '']).pid;
+  fs.writeFileSync(
+    path.join(stateDir, 'migrate.lock'),
+    JSON.stringify({ pid: deadPid, uid: process.getuid(), start_ms: Date.now() - 1000, role: 'migrate' })
+  );
+  const r = runRaw([], repo);
+  assert.notEqual(r.status, 0);
+});
+
+test('eghs-init aborts on a corrupt migrate.lock body and points at --clear-migrate-lock', () => {
+  const repo = mkTmpRepo();
+  const stateDir = stateDirOf(repo);
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, 'migrate.lock'), '{ nope');
+  const r = runRaw([], repo);
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /--clear-migrate-lock/);
+});
+
+test('eghs-init aborts when the admin mutex is held elsewhere (timeout, no state touched)', () => {
+  const repo = mkTmpRepo();
+  const stateDir = stateDirOf(repo);
+  fs.mkdirSync(path.join(stateDir, 'locks'), { recursive: true });
+  const guard = path.join(stateDir, 'locks', 'admin-mutex.guard');
+  const sentinel = path.join(repo, 'holder-ready');
+  const holder = spawn('node', ['-e', `
+    const fs = require('fs');
+    const { flockSync } = require(${JSON.stringify(require.resolve('fs-ext'))});
+    const fd = fs.openSync(${JSON.stringify(guard)}, 'w');
+    flockSync(fd, 'exnb');
+    fs.writeFileSync(${JSON.stringify(sentinel)}, '1');
+    setTimeout(() => {}, 10000);
+  `]);
+  try {
+    const t0 = Date.now();
+    while (!fs.existsSync(sentinel) && Date.now() - t0 < 5000) {
+      spawnSync('node', ['-e', 'setTimeout(()=>{},10)']);
+    }
+    assert.ok(fs.existsSync(sentinel), 'holder never took the mutex');
+    const r = runRaw([], repo, { EGHS_ADMIN_MUTEX_TIMEOUT_MS: '300' });
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /admin/);
+    assert.ok(!fs.existsSync(path.join(stateDir, 'schema_version')));
+  } finally {
+    holder.kill('SIGKILL');
+  }
+});
+
+test('.init.lock now carries a JSON body {pid, uid, start_ms}', () => {
+  const repo = mkTmpRepo();
+  const stateDir = stateDirOf(repo);
+  fs.mkdirSync(stateDir, { recursive: true });
+  // Block at step 4 by pre-holding .init.lock with a LIVE body, then check
+  // the error message names the holder pid (proves the body was parsed).
+  fs.writeFileSync(
+    path.join(stateDir, '.init.lock'),
+    JSON.stringify({ pid: process.pid, uid: process.getuid(), start_ms: Date.now() })
+  );
+  const r = runRaw([], repo);
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, new RegExp(`pid=${process.pid}`));
+});
+
+test('.init.lock corrupt body aborts with --clear-init-lock guidance', () => {
+  const repo = mkTmpRepo();
+  const stateDir = stateDirOf(repo);
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, '.init.lock'), JSON.stringify({ pid: -5 }));
+  const r = runRaw([], repo);
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /--clear-init-lock/);
+});
+
+test('.init.lock same-uid dead past 60s grace is reclaimed (init proceeds)', () => {
+  const repo = mkTmpRepo();
+  const stateDir = stateDirOf(repo);
+  fs.mkdirSync(stateDir, { recursive: true });
+  const deadPid = spawnSync('node', ['-e', '']).pid;
+  fs.writeFileSync(
+    path.join(stateDir, '.init.lock'),
+    JSON.stringify({ pid: deadPid, uid: process.getuid(), start_ms: Date.now() - 61000 })
+  );
+  const r = runRaw([], repo);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(fs.readFileSync(path.join(stateDir, 'schema_version'), 'utf8'), '1\n');
+});
+
+test('.init.lock same-uid dead WITHIN 60s grace aborts (recent-crash protection)', () => {
+  const repo = mkTmpRepo();
+  const stateDir = stateDirOf(repo);
+  fs.mkdirSync(stateDir, { recursive: true });
+  const deadPid = spawnSync('node', ['-e', '']).pid;
+  fs.writeFileSync(
+    path.join(stateDir, '.init.lock'),
+    JSON.stringify({ pid: deadPid, uid: process.getuid(), start_ms: Date.now() - 1000 })
+  );
+  const r = runRaw([], repo);
+  assert.notEqual(r.status, 0);
+});
+
+test('--repair Case 5 (everything healthy) is a silent no-op exit 0', () => {
+  const repo = mkTmpRepo();
+  run([], repo);
+  const schemaPath = path.join(stateDirOf(repo), 'schema_version');
+  const before = fs.statSync(schemaPath).mtimeMs;
+  const r = runRaw(['--repair'], repo);
+  assert.equal(r.status, 0);
+  assert.equal(fs.statSync(schemaPath).mtimeMs, before, 'schema_version must not be rewritten');
+});
+
+test('--repair Case 1 (INVALID schema) rewrites schema_version after subdirs+fs-info', () => {
+  const repo = mkTmpRepo();
+  run([], repo);
+  const schemaPath = path.join(stateDirOf(repo), 'schema_version');
+  fs.writeFileSync(schemaPath, '01\n'); // leading zero = strict-regex INVALID
+  const r = runRaw(['--repair'], repo);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(fs.readFileSync(schemaPath, 'utf8'), '1\n');
+});
