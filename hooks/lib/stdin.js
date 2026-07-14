@@ -34,4 +34,4 @@ function readStdin() {
   return Buffer.concat(chunks).toString('utf8');
 }
 
-module.exports = { readStdin };
+module.exports = { readStdin, sleepMs };
