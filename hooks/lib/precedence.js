@@ -1,5 +1,7 @@
 'use strict';
+const fs = require('fs');
 const path = require('path');
+const { isAlive } = require('./proc');
 const { resolveStateDir } = require('./state-dir');
 const { readSchemaVersion } = require('./schema');
 const { checkKillSwitch } = require('./kill-switch');
@@ -113,4 +115,123 @@ function earlyPrecedence(hookKind, input, { env, cwd, nowMs }) {
   };
 }
 
-module.exports = { earlyPrecedence };
+// ---------------------------------------------------------------------------
+// #4 — migrate.lock check (PRD §R6 lines 737-760). First stage allowed to
+// mutate state (stale-lock deletion). Returns a candidate object or null.
+
+const MIGRATE_LOCK_GRACE_MS = 600000; // same-uid dead-lock reclaim grace
+const FOREIGN_MIGRATE_LOCK_GRACE_MS = 7200000; // 2h before a foreign lock reads as stale
+
+function readMigrateLockBody(lockPath) {
+  try {
+    const body = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+    return body !== null && typeof body === 'object' && typeof body.uid === 'number' && typeof body.pid === 'number' && typeof body.start_ms === 'number'
+      ? body
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function checkMigrateLock(stateDir, { uid, nowMs }) {
+  const lockPath = path.join(stateDir, 'migrate.lock');
+  let st;
+  try {
+    st = fs.lstatSync(lockPath);
+  } catch (err) {
+    if (err.code === 'ENOENT') return null;
+    return { candidate: 'INFRA_NOT_READY', reason: 'infra_not_ready' };
+  }
+  if (!st.isFile()) {
+    // Non-regular type: infra fault, never FILE_UNREADABLE (no auto-bypass).
+    process.stderr.write('[eghs] migrate.lock is not a regular file; run: eghs-migrate --clear-migrate-lock\n');
+    return { candidate: 'INFRA_NOT_READY', reason: 'migrate_lock_corrupt' };
+  }
+
+  // Parse with one retry (an open/rename race can surface as a torn read).
+  let body = readMigrateLockBody(lockPath);
+  if (body === null) {
+    if (!fs.existsSync(lockPath)) return null; // ENOENT race: migrate finished
+    body = readMigrateLockBody(lockPath);
+    if (body === null) {
+      process.stderr.write('[eghs] migrate.lock body corrupt; run: eghs-migrate --clear-migrate-lock\n');
+      return { candidate: 'INFRA_NOT_READY', reason: 'migrate_lock_corrupt' };
+    }
+  }
+
+  if (body.uid !== uid) {
+    if (nowMs - body.start_ms < FOREIGN_MIGRATE_LOCK_GRACE_MS) {
+      return { candidate: 'MIGRATE_IN_PROGRESS' };
+    }
+    // Foreign-stale: never auto-delete another user's lock.
+    process.stderr.write('[eghs] stale foreign migrate.lock; run: eghs-migrate --force-foreign-cleanup\n');
+    return { candidate: 'INFRA_NOT_READY', reason: 'infra_not_ready' };
+  }
+  if (isAlive(body.pid)) {
+    // Covers same-uid EPERM too (isAlive is fail-closed on non-ESRCH).
+    return { candidate: 'MIGRATE_IN_PROGRESS' };
+  }
+  if (nowMs - body.start_ms < MIGRATE_LOCK_GRACE_MS) {
+    return { candidate: 'MIGRATE_IN_PROGRESS' }; // fresh crash: protect the grace window
+  }
+  try {
+    fs.unlinkSync(lockPath); // stale: same uid + dead + grace elapsed
+  } catch {
+    // raced with another hook's reclaim: either way it's gone or will be
+  }
+  return null;
+}
+
+// Hook-type reclassification matrix (PRD §R6 #4 table; #6 lease failures and
+// #3.3/#3.7 candidates route through the same rows). Input: a candidate
+// {candidate, reason?}; output: what the entrypoint must actually do.
+const MARKER_REASONS = {
+  MIGRATE_IN_PROGRESS: 'migrate_in_progress',
+  SID_COLLISION: 'sid_collision',
+};
+
+function classifyCandidate(hookKind, { candidate, reason }) {
+  if (!HOOK_KINDS.has(hookKind)) throw new Error(`unknown hook kind: ${hookKind}`);
+  switch (hookKind) {
+    case 'ups':
+      return {
+        action: 'exit0',
+        additionalContext:
+          candidate === 'MIGRATE_IN_PROGRESS'
+            ? 'eghs: migrate in progress — state writes paused'
+            : candidate === 'SID_COLLISION'
+              ? 'eghs: sid collision detected, check Claude Code sid uniqueness'
+              : 'eghs: state infrastructure not ready — run eghs-init --repair',
+      };
+    case 'stop':
+      // G3: verification did not run, so nothing may auto-pass. MIGRATE is
+      // masked as INFRA_NOT_READY (auto-unblock No); the original candidate
+      // goes to the debug log only.
+      return {
+        action: 'deny',
+        denyCode: candidate === 'SID_COLLISION' ? 'SID_COLLISION' : 'INFRA_NOT_READY',
+        autoUnblock: false,
+        reason,
+        maskedFrom: candidate,
+      };
+    case 'post-write':
+      return {
+        action: 'marker_exit0',
+        markerReason: MARKER_REASONS[candidate] || reason || 'infra_not_ready',
+      };
+    case 'post-read':
+      return { action: 'exit0' };
+    case 'pre-write':
+    case 'pre-read':
+      return {
+        action: 'deny',
+        denyCode: candidate,
+        autoUnblock: candidate === 'MIGRATE_IN_PROGRESS',
+        reason,
+      };
+    default:
+      throw new Error(`unreachable hook kind: ${hookKind}`);
+  }
+}
+
+module.exports = { earlyPrecedence, checkMigrateLock, classifyCandidate };
