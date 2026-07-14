@@ -3,7 +3,7 @@
 const { readStdin } = require('./lib/stdin');
 const { resolveToolHookContext, isOutsideRepo } = require('./lib/tool-hook');
 const { canonicalKey, canonicalKeyAllowMissing, sha256File } = require('./lib/canonical');
-const { writePreFile, gcPreFiles } = require('./lib/pre-file');
+const { writePreFile, gcPreFiles, normalizeToolUseId } = require('./lib/pre-file');
 const { appendDebugLog } = require('./lib/debug-log');
 
 // P3 PreToolUse is RECORD-ONLY: the R3 gate is off, so this hook ALWAYS
@@ -35,6 +35,7 @@ function main() {
   if (ctx.skip) return;
 
   const nowMs = Date.now();
+  const toolUseId = normalizeToolUseId(input.tool_use_id);
   gcPreFiles(ctx.stateDir, { nowMs });
 
   const resolved =
@@ -57,7 +58,7 @@ function main() {
       appendDebugLog(ctx.stateDir, ctx.sid, { ts_ms: nowMs, hook: 'PreToolUse', tool: input.tool_name, decision: 'skip', deny_code: 'FILE_UNREADABLE' });
       return;
     }
-    writePreFile(ctx.stateDir, ctx.sid, resolved.key, 'read', { sha: hashed.sha, ts_ms: nowMs, pretool_sid: ctx.sid });
+    writePreFile(ctx.stateDir, ctx.sid, resolved.key, toolUseId, 'read', { sha: hashed.sha, ts_ms: nowMs, pretool_sid: ctx.sid });
   } else {
     let preSha = null;
     if (!resolved.missing) {
@@ -70,7 +71,7 @@ function main() {
       }
       preSha = hashed.sha;
     }
-    writePreFile(ctx.stateDir, ctx.sid, resolved.key, 'write', { pre_sha: preSha, ts_ms: nowMs, pretool_sid: ctx.sid });
+    writePreFile(ctx.stateDir, ctx.sid, resolved.key, toolUseId, 'write', { pre_sha: preSha, ts_ms: nowMs, pretool_sid: ctx.sid });
   }
   appendDebugLog(ctx.stateDir, ctx.sid, { ts_ms: nowMs, hook: 'PreToolUse', tool: input.tool_name, decision: 'record', deny_code: null });
 }

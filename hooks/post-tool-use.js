@@ -8,7 +8,7 @@ const { loadConfig } = require('./lib/config');
 const { canonicalKey, canonicalKeyAllowMissing, keyHash, sha256File } = require('./lib/canonical');
 const { isAlive } = require('./lib/proc');
 const { writeReadState, writeFailedMarker, clearMarkersOnSuccess } = require('./lib/read-state');
-const { readPreFile, deletePreFile, gcPreFiles } = require('./lib/pre-file');
+const { readPreFile, deletePreFile, gcPreFiles, normalizeToolUseId, listPreFilesForHash } = require('./lib/pre-file');
 const { ensureSessionLease } = require('./lib/session');
 const { appendDebugLog } = require('./lib/debug-log');
 
@@ -31,6 +31,7 @@ function skipLog(ctx, input, nowMs, denyCode) {
 
 // R2 Read handler: classify the evidence grade and record it.
 function handleRead(ctx, input, config, lease, nowMs) {
+  const toolUseId = normalizeToolUseId(input.tool_use_id);
   const resolved = canonicalKey(input.tool_input.file_path, { caseless: ctx.caseless });
   if (!resolved.ok) {
     // Vanished or unreadable after the Read ran: nothing provable to record.
@@ -60,7 +61,7 @@ function handleRead(ctx, input, config, lease, nowMs) {
       sid: ctx.sid,
       evidence: 'partial_read',
     });
-    deletePreFile(ctx.stateDir, ctx.sid, key, 'read');
+    deletePreFile(ctx.stateDir, ctx.sid, key, toolUseId, 'read');
     appendDebugLog(ctx.stateDir, ctx.sid, { ts_ms: nowMs, hook: 'PostToolUse', tool: 'Read', decision: 'record', deny_code: null, evidence: 'partial_read' });
   }
 
@@ -90,7 +91,7 @@ function handleRead(ctx, input, config, lease, nowMs) {
   // TOCTOU (PRD §R2): compare against the PreToolUse-time sha when present.
   // A mismatch means the disk changed between the Read tool and this hook —
   // the model may have seen either version, so the evidence is poisoned.
-  const pre = readPreFile(ctx.stateDir, ctx.sid, key, 'read');
+  const pre = readPreFile(ctx.stateDir, ctx.sid, key, toolUseId, 'read');
   const stale = pre !== null && typeof pre.sha === 'string' && pre.sha !== hashed.sha;
   const evidence = stale ? 'stale_read' : 'full_read';
 
@@ -111,7 +112,7 @@ function handleRead(ctx, input, config, lease, nowMs) {
     clearMarkersOnSuccess(ctx.stateDir, key, { sid: ctx.sid, leaseStartMs: lease.start_ms });
   }
 
-  deletePreFile(ctx.stateDir, ctx.sid, key, 'read');
+  deletePreFile(ctx.stateDir, ctx.sid, key, toolUseId, 'read');
   appendDebugLog(ctx.stateDir, ctx.sid, {
     ts_ms: nowMs,
     hook: 'PostToolUse',
@@ -148,7 +149,7 @@ function leaseIsDead(stateDir, sid) {
 
 function handleMissingPre(ctx, key, nowMs) {
   const preRoot = path.join(ctx.stateDir, 'pre');
-  const orphanName = `${keyHash(key)}.write.json`;
+  const hash = keyHash(key);
   let sids = [];
   try {
     sids = fs.readdirSync(preRoot);
@@ -158,8 +159,10 @@ function handleMissingPre(ctx, key, nowMs) {
   let orphanFound = false;
   for (const otherSid of sids) {
     if (otherSid === ctx.sid || otherSid === 'tmp') continue;
-    const orphanPath = path.join(preRoot, otherSid, orphanName);
-    if (!fs.existsSync(orphanPath)) continue;
+    // A dead session may have left several records for this key (parallel
+    // tool calls, distinct tool_use_ids) — every one is the same orphan case.
+    const orphans = listPreFilesForHash(ctx.stateDir, otherSid, hash, 'write');
+    if (orphans.length === 0) continue;
     if (!leaseIsDead(ctx.stateDir, otherSid)) continue; // 활성 lease 보호: never touch a live session
     orphanFound = true;
     // Marker lands under the DEAD sid (origin preserved): it can never block
@@ -171,13 +174,15 @@ function handleMissingPre(ctx, key, nowMs) {
       sidScoped: true,
     });
     // Re-verify right before the destructive step (PRD R4 line 451): the sid
-    // may have been revived since the check above. If so, leave the pre-file
+    // may have been revived since the check above. If so, leave the pre-files
     // for the revived session's own PostToolUse to consume.
     if (!leaseIsDead(ctx.stateDir, otherSid)) continue;
-    try {
-      fs.unlinkSync(orphanPath);
-    } catch {
-      // raced with GC: fine
+    for (const orphan of orphans) {
+      try {
+        fs.unlinkSync(orphan.path);
+      } catch {
+        // raced with GC: fine
+      }
     }
   }
   if (!orphanFound) {
@@ -194,6 +199,7 @@ function handleMissingPre(ctx, key, nowMs) {
 
 // R4 processing matrix (PRD lines 457-468) — gate off, records only.
 function handleWrite(ctx, input, lease, nowMs) {
+  const toolUseId = normalizeToolUseId(input.tool_use_id);
   const resolved = canonicalKeyAllowMissing(input.tool_input.file_path, { caseless: ctx.caseless });
   if (!resolved.ok) {
     skipLog(ctx, input, nowMs, 'FILE_UNREADABLE');
@@ -215,13 +221,13 @@ function handleWrite(ctx, input, lease, nowMs) {
   }
   const postSha = post.ok ? post.sha : null;
 
-  const pre = readPreFile(ctx.stateDir, ctx.sid, key, 'write');
+  const pre = readPreFile(ctx.stateDir, ctx.sid, key, toolUseId, 'write');
   if (pre !== null && pre.pretool_sid !== ctx.sid) {
     // MVP #17: pretool_sid/posttool_sid invariant broken — poisoned record.
     // Marker BEFORE deleting the pre-file: if the marker write fails, the
     // pre-file must survive as the only remaining trace of the poisoning.
     writeFailedMarker(ctx.stateDir, key, { sid: ctx.sid, tsMs: nowMs, reason: 'state_record_failed', sidScoped: true });
-    deletePreFile(ctx.stateDir, ctx.sid, key, 'write');
+    deletePreFile(ctx.stateDir, ctx.sid, key, toolUseId, 'write');
     skipLog(ctx, input, nowMs, 'STATE_RECORD_FAILED');
     return;
   }
@@ -277,7 +283,7 @@ function handleWrite(ctx, input, lease, nowMs) {
   }
   if (warn) process.stderr.write(`[eghs] post-tool-use: ${warn}: ${key}\n`);
 
-  deletePreFile(ctx.stateDir, ctx.sid, key, 'write'); // PRD R4: consumed last
+  deletePreFile(ctx.stateDir, ctx.sid, key, toolUseId, 'write'); // PRD R4: consumed last
   appendDebugLog(ctx.stateDir, ctx.sid, {
     ts_ms: nowMs,
     hook: 'PostToolUse',

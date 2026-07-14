@@ -183,7 +183,7 @@ test("R4 orphan pre-file from a dead sid → dead sid's marker, orphan unlinked,
   fs.writeFileSync(file, 'x');
   const preDir = path.join(repo, '.claude', 'state', 'eghs', 'pre', DEAD_SID);
   fs.mkdirSync(preDir, { recursive: true });
-  const orphan = path.join(preDir, `${keyHash(canonKey(repo, file))}.write.json`);
+  const orphan = path.join(preDir, `${keyHash(canonKey(repo, file))}.none.write.json`);
   fs.writeFileSync(
     orphan,
     JSON.stringify({ schema_version: 1, pre_sha: null, pretool_sid: DEAD_SID })
@@ -200,7 +200,7 @@ test('R4 orphan scan claims a pre-file whose lease names a DEAD pid', () => {
   fs.writeFileSync(file, 'x');
   const preDir = path.join(repo, '.claude', 'state', 'eghs', 'pre', DEAD_SID);
   fs.mkdirSync(preDir, { recursive: true });
-  const orphan = path.join(preDir, `${keyHash(canonKey(repo, file))}.write.json`);
+  const orphan = path.join(preDir, `${keyHash(canonKey(repo, file))}.none.write.json`);
   fs.writeFileSync(
     orphan,
     JSON.stringify({ schema_version: 1, pre_sha: null, pretool_sid: DEAD_SID })
@@ -222,7 +222,7 @@ test('R4 orphan scan never touches a pre-file whose sid holds a LIVE lease', () 
   fs.writeFileSync(file, 'x');
   const preDir = path.join(repo, '.claude', 'state', 'eghs', 'pre', DEAD_SID);
   fs.mkdirSync(preDir, { recursive: true });
-  const orphan = path.join(preDir, `${keyHash(canonKey(repo, file))}.write.json`);
+  const orphan = path.join(preDir, `${keyHash(canonKey(repo, file))}.none.write.json`);
   fs.writeFileSync(
     orphan,
     JSON.stringify({ schema_version: 1, pre_sha: null, pretool_sid: DEAD_SID })
@@ -245,7 +245,7 @@ test('R4 orphan scan treats a CORRUPT lease as live (fail-closed, pre-file untou
   fs.writeFileSync(file, 'x');
   const preDir = path.join(repo, '.claude', 'state', 'eghs', 'pre', DEAD_SID);
   fs.mkdirSync(preDir, { recursive: true });
-  const orphan = path.join(preDir, `${keyHash(canonKey(repo, file))}.write.json`);
+  const orphan = path.join(preDir, `${keyHash(canonKey(repo, file))}.none.write.json`);
   fs.writeFileSync(
     orphan,
     JSON.stringify({ schema_version: 1, pre_sha: null, pretool_sid: DEAD_SID })
@@ -268,7 +268,7 @@ test('R4 pretool_sid mismatch is treated as a failed record (poisoned pre-file c
   const preDir = path.join(repo, '.claude', 'state', 'eghs', 'pre', SID);
   fs.mkdirSync(preDir, { recursive: true });
   fs.writeFileSync(
-    path.join(preDir, `${keyHash(canonKey(repo, file))}.write.json`),
+    path.join(preDir, `${keyHash(canonKey(repo, file))}.none.write.json`),
     JSON.stringify({ schema_version: 1, pre_sha: null, pretool_sid: DEAD_SID })
   );
   runHook(POST_HOOK, repo, editInput('PostToolUse', file));
@@ -293,4 +293,25 @@ test('Write and MultiEdit run the same matrix as Edit', () => {
     readState(repo, file).sha,
     crypto.createHash('sha256').update('v3').digest('hex')
   );
+});
+
+test('tool_use_id keys the Pre→Post join: parallel calls on one file stay distinct (R16)', () => {
+  const repo = mkRepo();
+  const file = path.join(repo, 'par.txt');
+  fs.writeFileSync(file, 'v1');
+  const withId = (event, id) => ({ ...editInput(event, file), tool_use_id: id });
+  // Two overlapping PreToolUse calls, distinct tool_use_ids.
+  runHook(PRE_HOOK, repo, withId('PreToolUse', 'toolu_AAA'));
+  fs.writeFileSync(file, 'v2'); // call A applies
+  runHook(PRE_HOOK, repo, withId('PreToolUse', 'toolu_BBB'));
+  assert.equal(preWriteFileCount(repo, SID), 2);
+  const preDir = path.join(repo, '.claude', 'state', 'eghs', 'pre', SID);
+  const hash = keyHash(canonKey(repo, file));
+  assert.ok(fs.existsSync(path.join(preDir, `${hash}.toolu_AAA.write.json`)));
+  assert.ok(fs.existsSync(path.join(preDir, `${hash}.toolu_BBB.write.json`)));
+  // Post for A consumes only A's record; B's stays for its own Post.
+  runHook(POST_HOOK, repo, withId('PostToolUse', 'toolu_AAA'));
+  assert.ok(!fs.existsSync(path.join(preDir, `${hash}.toolu_AAA.write.json`)));
+  assert.ok(fs.existsSync(path.join(preDir, `${hash}.toolu_BBB.write.json`)));
+  assert.equal(readState(repo, file).evidence, 'post_edit_success'); // v1→v2 changed, no error
 });

@@ -14,7 +14,7 @@ const { readFsInfo } = require('./lib/fs-info');
 const { canonicalKeyAllowMissing, keyHash } = require('./lib/canonical');
 const { isOutsideRepo } = require('./lib/tool-hook');
 const { readReadState } = require('./lib/read-state');
-const { readPreFile } = require('./lib/pre-file');
+const { listPreFilesForHash } = require('./lib/pre-file');
 const { isValidSid } = require('./lib/sid');
 const { isAlive } = require('./lib/proc');
 
@@ -93,9 +93,18 @@ function dryRun(stateDir, repoRoot, caseless, input) {
     state: readReadState(stateDir, key),
     key_marker: readJson(path.join(stateDir, 'failed', `${hash}.json`)),
     sid_marker: sid ? readJson(path.join(stateDir, 'failed', sid, `${hash}.json`)) : null,
-    pre_read: sid ? readPreFile(stateDir, sid, key, 'read') : null,
-    pre_write: sid ? readPreFile(stateDir, sid, key, 'write') : null,
+    pre_read: sid ? preEntries(stateDir, sid, hash, 'read') : [],
+    pre_write: sid ? preEntries(stateDir, sid, hash, 'write') : [],
   };
+}
+
+// One entry per tool_use_id (R16 amendment: parallel calls keep distinct
+// pre-records, so a dry-run must show all of them).
+function preEntries(stateDir, sid, hash, kind) {
+  return listPreFilesForHash(stateDir, sid, hash, kind).map(({ toolUseId, path: p }) => ({
+    tool_use_id: toolUseId,
+    body: readJson(p),
+  }));
 }
 
 function main() {

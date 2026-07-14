@@ -116,8 +116,9 @@ test('--dry-run surfaces an existing full_read record and pre-file for the file'
   const out = JSON.parse(stdout);
   assert.equal(out.state.evidence, 'full_read');
   assert.equal(out.state.sid, SID);
-  assert.equal(typeof out.pre_write.pre_sha, 'string');
-  assert.equal(out.pre_read, null); // consumed by the earlier PostToolUse
+  assert.equal(out.pre_write.length, 1); // one entry per tool_use_id (R16)
+  assert.equal(typeof out.pre_write[0].body.pre_sha, 'string');
+  assert.deepEqual(out.pre_read, []); // consumed by the earlier PostToolUse
 });
 
 test('--dry-run with malformed stdin exits 1', () => {
