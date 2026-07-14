@@ -3,7 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const { isAlive } = require('./proc');
 const { resolveStateDir, STATE_SUBDIRS } = require('./state-dir');
-const { readSchemaVersion } = require('./schema');
+const { readSchemaVersion, HOOK_SCHEMA_VERSION } = require('./schema');
 const { checkKillSwitch } = require('./kill-switch');
 const { isCI } = require('./ci');
 const { readFsInfo } = require('./fs-info');
@@ -13,6 +13,8 @@ const { acquireSidGuard } = require('./guard');
 const { gcSessions, sweepOrphanTombstones } = require('./session');
 const { gcPreFiles } = require('./pre-file');
 const { appendDebugLog } = require('./debug-log');
+const { loadConfig } = require('./config');
+const { establishLeaseAndBaseline } = require('./lease');
 
 // PRD §R6 precedence chain, stages #1-#3.7 (the mutation-free prefix; the
 // single sanctioned exception is #3.7's guard.lock create). Later stages
@@ -311,4 +313,178 @@ function gcPass(ctx, config) {
   return { candidate: 'INFRA_NOT_READY', reason: 'infra_not_ready' };
 }
 
-module.exports = { earlyPrecedence, checkMigrateLock, classifyCandidate, gcPass };
+// ---------------------------------------------------------------------------
+// #6 — session lease + baseline (PRD §R6 lines 776-813). Runs only when the
+// schema is healthy; a re-check of migrate.lock + on-disk schema closes the
+// #1↔#6 TOCTOU (a migrate that completed mid-chain). Returns:
+//   {ok:true, lease}
+//   {candidate, reason?}          — SID_COLLISION / INFRA lease_unavailable /
+//                                    MIGRATE_IN_PROGRESS (TOCTOU)
+//   {skip:true}                   — schema not healthy; #7 classifies
+function establishLease(ctx) {
+  const { stateDir, sid, diskSchema, nowMs, repoRoot, fsInfo } = ctx;
+
+  // #6.1/#6.2 TOCTOU: migrate may have finished between #1 and now.
+  if (fs.existsSync(path.join(stateDir, 'migrate.lock'))) {
+    return { candidate: 'MIGRATE_IN_PROGRESS' };
+  }
+  const now = readSchemaVersion(stateDir);
+  const diskSchemaNow = now.status === 'not_initialized' ? null : now.status === 'invalid' ? 'INVALID' : now.version;
+  if (diskSchemaNow !== diskSchema) return { candidate: 'MIGRATE_IN_PROGRESS' };
+
+  // #6.3/#6.4: lease only when schema matches the hook version and fs-info ok.
+  if (diskSchemaNow !== HOOK_SCHEMA_VERSION || fsInfo.status !== 'ok') return { skip: true };
+
+  const result = establishLeaseAndBaseline(stateDir, sid, {
+    pid: process.ppid,
+    uid: process.getuid(),
+    nowMs,
+    repoRoot,
+    onEvent: (e) => appendDebugLog(stateDir, sid, { ts_ms: nowMs, ...e }),
+  });
+  return result.ok ? { ok: true, lease: result.lease } : result; // candidate passthrough
+}
+
+// #7 — schema / fs-info status classification, per hook (PRD §R6 lines
+// 814-838). Only reached when the schema was NOT healthy (or fs-info missing);
+// the healthy path returns {outcome:'continue'} from runPrecedence directly.
+function classifySchemaState(ctx) {
+  const { diskSchema, fsInfo } = ctx;
+  if (diskSchema === null) return 'NOT_INITIALIZED';
+  if (diskSchema === 'INVALID') return 'INVALID';
+  if (diskSchema !== HOOK_SCHEMA_VERSION) return 'MISMATCH';
+  if (fsInfo.status !== 'ok') return 'FS_INFO_MISSING';
+  return 'OK';
+}
+
+function classifySchemaForHook(hookKind, state) {
+  switch (hookKind) {
+    case 'ups':
+      // R1 fail-soft: never block the user's prompt.
+      return {
+        action: 'exit0',
+        additionalContext:
+          state === 'MISMATCH' ? 'eghs: schema mismatch — run eghs-migrate' : 'eghs: state not ready — run eghs-init',
+      };
+    case 'stop':
+      // MISMATCH/FS_INFO_MISSING: state dir exists, verification is
+      // state-independent → proceed. NOT_INITIALIZED/INVALID → fail-closed.
+      if (state === 'MISMATCH' || state === 'FS_INFO_MISSING') return { action: 'continue' };
+      return { action: 'deny', denyCode: 'INFRA_NOT_READY', autoUnblock: false, reason: 'infra_not_ready' };
+    case 'post-write':
+      // INVALID never fail-OPEN: leave a sid-scoped schema_invalid marker.
+      if (state === 'INVALID') return { action: 'marker_exit0', markerReason: 'schema_invalid' };
+      return { action: 'exit0' };
+    case 'post-read':
+      return { action: 'exit0' };
+    case 'pre-write':
+    case 'pre-read':
+      switch (state) {
+        case 'NOT_INITIALIZED':
+          return { action: 'deny', denyCode: 'SCHEMA_NOT_INITIALIZED', autoUnblock: true };
+        case 'MISMATCH':
+          return { action: 'deny', denyCode: 'SCHEMA_MISMATCH', autoUnblock: false };
+        case 'FS_INFO_MISSING':
+          return { action: 'deny', denyCode: 'FS_INFO_MISSING', autoUnblock: true };
+        default: // INVALID
+          return { action: 'deny', denyCode: 'INFRA_NOT_READY', autoUnblock: false, reason: 'infra_not_ready' };
+      }
+    default:
+      throw new Error(`unreachable hook kind: ${hookKind}`);
+  }
+}
+
+// A #4/#5/#6 candidate → the entrypoint-facing outcome, via the #4 matrix.
+function candidateToOutcome(hookKind, candidate) {
+  const a = classifyCandidate(hookKind, candidate);
+  switch (a.action) {
+    case 'exit0':
+      return { outcome: 'exit0', reason: 'candidate', additionalContext: a.additionalContext };
+    case 'marker_exit0':
+      return { outcome: 'marker_exit0', markerReason: a.markerReason };
+    case 'deny':
+      return { outcome: 'deny', denyCode: a.denyCode, autoUnblock: a.autoUnblock, reason: a.reason, maskedFrom: a.maskedFrom };
+    default:
+      throw new Error(`unreachable action: ${a.action}`);
+  }
+}
+
+// A #7 schema-state action → the entrypoint-facing outcome (with ctx when
+// it says continue).
+function schemaActionToOutcome(action, ctx) {
+  switch (action.action) {
+    case 'continue':
+      return { outcome: 'continue', ctx };
+    case 'exit0':
+      return { outcome: 'exit0', reason: 'schema', additionalContext: action.additionalContext };
+    case 'marker_exit0':
+      return { outcome: 'marker_exit0', markerReason: action.markerReason };
+    case 'deny':
+      return { outcome: 'deny', denyCode: action.denyCode, autoUnblock: action.autoUnblock, reason: action.reason };
+    default:
+      throw new Error(`unreachable schema action: ${action.action}`);
+  }
+}
+
+// Full PRD §R6 precedence chain #1-#8. The single entrypoint every hook calls.
+// Returns one of:
+//   {outcome:'continue', ctx}                 — run hook logic (#8)
+//   {outcome:'exit0', reason, additionalContext?}
+//   {outcome:'marker_exit0', markerReason}    — PostToolUse fail-closed marker
+//   {outcome:'deny', denyCode, autoUnblock?, reason?, maskedFrom?}
+function runPrecedence(hookKind, input, { env, cwd, nowMs }) {
+  const early = earlyPrecedence(hookKind, input, { env, cwd, nowMs });
+  if (early.outcome === 'exit0') return early;
+  if (early.outcome === 'deny') return early; // NO_SESSION (final)
+  if (early.outcome === 'candidate') {
+    if (early.ctx && typeof early.ctx.guardFd === 'number') fs.closeSync(early.ctx.guardFd);
+    return candidateToOutcome(hookKind, early);
+  }
+
+  const ctx = early.ctx;
+  let config;
+  try {
+    config = loadConfig(ctx.repoRoot);
+  } catch (err) {
+    // A malformed eghs.config.json is an infra fault, not a bypass.
+    process.stderr.write(`[eghs] ${err.message}\n`);
+    if (typeof ctx.guardFd === 'number') fs.closeSync(ctx.guardFd);
+    return candidateToOutcome(hookKind, { candidate: 'INFRA_NOT_READY', reason: 'infra_not_ready' });
+  }
+  ctx.config = config;
+
+  const settle = (result) => {
+    // A non-continue result means this hook is done — release the guard now.
+    if (result.outcome !== 'continue' && typeof ctx.guardFd === 'number') {
+      fs.closeSync(ctx.guardFd);
+      ctx.guardFd = null;
+    }
+    return result;
+  };
+
+  // #4 migrate.lock.
+  const mig = checkMigrateLock(ctx.stateDir, { uid: process.getuid(), nowMs });
+  if (mig) return settle(candidateToOutcome(hookKind, mig));
+
+  // #5 GC + subdir validation.
+  const gc = gcPass(ctx, config);
+  if (gc) return settle(candidateToOutcome(hookKind, gc));
+
+  // #6 lease/baseline (healthy schema only).
+  const lease = establishLease(ctx);
+  if (lease.candidate) return settle(candidateToOutcome(hookKind, lease));
+  if (lease.ok) ctx.lease = lease.lease;
+
+  // #7 schema/fs-info classification.
+  const state = classifySchemaState(ctx);
+  if (state === 'OK') return { outcome: 'continue', ctx }; // → #8 hook logic
+  return settle(schemaActionToOutcome(classifySchemaForHook(hookKind, state), ctx));
+}
+
+module.exports = {
+  earlyPrecedence,
+  checkMigrateLock,
+  classifyCandidate,
+  gcPass,
+  runPrecedence,
+};

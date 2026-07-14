@@ -14,6 +14,15 @@ const DEFAULT_CONFIG = Object.freeze({
   max_full_read_bytes: 5 * 1024 * 1024, // above this a Read records partial_read (PRD §R2)
   matcher_engine: 'picomatch',
   debug: true,
+  // P4 gate (PRD §R3/§R6). state_gate_paths [] = gate applies to zero paths
+  // (dark by default); the deploy config supplies real core-source globs.
+  state_gate_paths: [],
+  stale_after_seconds: 1800, // R3 gate: full_read/post_edit_success freshness
+  session_stale_seconds: 86400,
+  read_state_stale_seconds: 2592000,
+  failed_marker_stale_seconds: 2592000,
+  verify_logs_stale_seconds: 604800,
+  tombstone_stale_seconds: 3600,
 });
 
 // Shallow top-level merge of .claude/eghs.config.json onto DEFAULT_CONFIG —
