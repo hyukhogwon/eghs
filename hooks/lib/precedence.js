@@ -2,7 +2,7 @@
 const fs = require('fs');
 const path = require('path');
 const { isAlive } = require('./proc');
-const { resolveStateDir } = require('./state-dir');
+const { resolveStateDir, STATE_SUBDIRS } = require('./state-dir');
 const { readSchemaVersion } = require('./schema');
 const { checkKillSwitch } = require('./kill-switch');
 const { isCI } = require('./ci');
@@ -10,6 +10,9 @@ const { readFsInfo } = require('./fs-info');
 const { isValidSid } = require('./sid');
 const { getRepoRoot } = require('./git');
 const { acquireSidGuard } = require('./guard');
+const { gcSessions, sweepOrphanTombstones } = require('./session');
+const { gcPreFiles } = require('./pre-file');
+const { appendDebugLog } = require('./debug-log');
 
 // PRD §R6 precedence chain, stages #1-#3.7 (the mutation-free prefix; the
 // single sanctioned exception is #3.7's guard.lock create). Later stages
@@ -234,4 +237,78 @@ function classifyCandidate(hookKind, { candidate, reason }) {
   }
 }
 
-module.exports = { earlyPrecedence, checkMigrateLock, classifyCandidate };
+// ---------------------------------------------------------------------------
+// #5 — GC pass + state subdir validation (PRD §R6 lines 761-775). The ONLY
+// place any GC happens (G5: no GC at hook start). Returns a candidate or
+// null to continue.
+
+const RECOVERY_GRACE_MS = 60000;
+
+// #5a: reclaim own-uid stale recover.lock leftovers (a crashed Stop reclaim).
+function gcRecoverLocks(stateDir, { uid, nowMs }) {
+  const locksDir = path.join(stateDir, 'locks');
+  let names = [];
+  try {
+    names = fs.readdirSync(locksDir).filter((n) => n.endsWith('.recover.lock'));
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    const p = path.join(locksDir, name);
+    let body;
+    try {
+      body = JSON.parse(fs.readFileSync(p, 'utf8'));
+    } catch {
+      continue; // unreadable: not provably stale, leave it
+    }
+    if (!body || body.uid !== uid) continue; // foreign: never touch
+    if (isAlive(body.pid)) continue;
+    const graceMs = typeof body.recovery_grace_ms === 'number' ? body.recovery_grace_ms : RECOVERY_GRACE_MS;
+    if (nowMs - body.start_ms < graceMs) continue;
+    try {
+      fs.unlinkSync(p);
+    } catch {
+      // raced -> fine
+    }
+  }
+}
+
+// #5b+#5c. Mutating GC only runs when the state dir is actually live
+// (diskSchema present); the subdir check classifies what's missing.
+function gcPass(ctx, config) {
+  const { stateDir, diskSchema, nowMs } = ctx;
+  const uid = process.getuid();
+
+  if (diskSchema !== null) {
+    gcRecoverLocks(stateDir, { uid, nowMs });
+    gcSessions(stateDir, {
+      nowMs,
+      uid,
+      sessionStaleSeconds: config.session_stale_seconds,
+      onEvent: (e) => appendDebugLog(stateDir, ctx.sid, { ts_ms: nowMs, ...e }),
+    });
+    sweepOrphanTombstones(stateDir, {
+      nowMs,
+      uid,
+      tombstoneStaleSeconds: config.tombstone_stale_seconds,
+    });
+    gcPreFiles(stateDir, { nowMs }); // 24h pre/ GC lives HERE, not at hook start
+  }
+
+  // #5c: state subdir validation.
+  const missing = STATE_SUBDIRS.some((sub) => {
+    try {
+      return !fs.statSync(path.join(stateDir, sub)).isDirectory();
+    } catch {
+      return true;
+    }
+  });
+  if (!missing) return null;
+  if (diskSchema === null) return null; // clean install: #7 handles NOT_INITIALIZED
+  // Partial init / hand-deleted subdir (schema ok) and INVALID/MISMATCH
+  // cases alike: infra fault, eghs-init --repair. Never mkdir here.
+  process.stderr.write('[eghs] state subdir missing; run: eghs-init --repair\n');
+  return { candidate: 'INFRA_NOT_READY', reason: 'infra_not_ready' };
+}
+
+module.exports = { earlyPrecedence, checkMigrateLock, classifyCandidate, gcPass };

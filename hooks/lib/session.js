@@ -99,11 +99,44 @@ function ensureSessionLease(stateDir, sid, { pid, uid, nowMs }) {
   return claimLease(filePath, existing, { sid, pid, uid, nowMs }, 5);
 }
 
-// PRD §R2.5 sessions/ GC: only delete when ALL of (stale by time, same uid
-// as the current GC caller, dead pid) hold. A foreign-uid dead lease is left
-// alone — only `eghs-migrate --force-foreign-cleanup` (not built in P1) may
-// remove those.
-function gcSessions(stateDir, { nowMs, uid, sessionStaleSeconds = 86400 }) {
+// Cascade targets for one sid (PRD §R2.5 §238 + R6 #5b, verbatim set).
+// guard.lock is listed FIRST — the guard depends on the lease, so it must
+// be gone before the lease is (a leaked guard after lease unlink would be a
+// permanent orphan; UUIDv4 sids never repeat).
+function cascadeTargets(stateDir, sid) {
+  return [
+    { p: path.join(stateDir, 'sessions', `${sid}.guard.lock`), dir: false },
+    { p: path.join(stateDir, 'baselines', `${sid}.txt`), dir: false },
+    { p: path.join(stateDir, 'verify-logs', sid), dir: true },
+    { p: path.join(stateDir, 'debug', `${sid}.jsonl`), dir: false },
+    { p: path.join(stateDir, 'pre', sid), dir: true },
+    { p: path.join(stateDir, 'failed', sid), dir: true },
+    { p: path.join(stateDir, 'locks', `stop-${sid}.lock`), dir: false },
+    { p: path.join(stateDir, 'locks', `stop-${sid}.recover.lock`), dir: false },
+    { p: path.join(stateDir, 'sessions', `${sid}.tombstone`), dir: false },
+  ];
+}
+
+// Best-effort delete of one cascade target. ENOENT counts as success;
+// EPERM/EACCES (and anything else) is a real failure the caller must react
+// to by KEEPING the lease (retry next pass — the sid-scoped markers' only
+// GC path is this cascade, so a lease deleted first would orphan them).
+function deleteTarget({ p, dir }) {
+  try {
+    if (dir) fs.rmSync(p, { recursive: true, force: true });
+    else fs.unlinkSync(p);
+    return true;
+  } catch (err) {
+    return err.code === 'ENOENT';
+  }
+}
+
+// PRD §R2.5 sessions/ GC (R16-R20: cascade-before-lease): only leases with
+// (stale by time, same uid, dead pid) are candidates. A foreign-uid dead
+// lease is left alone — only `eghs-migrate --force-foreign-cleanup` may
+// remove those. Cascade runs FIRST; the lease is unlinked only when every
+// target succeeded, so a partial cascade stays retryable.
+function gcSessions(stateDir, { nowMs, uid, sessionStaleSeconds = 86400, onEvent }) {
   const sessionsDir = path.join(stateDir, 'sessions');
   let entries = [];
   try {
@@ -115,11 +148,24 @@ function gcSessions(stateDir, { nowMs, uid, sessionStaleSeconds = 86400 }) {
 
   for (const entry of entries) {
     const filePath = path.join(sessionsDir, entry);
+    const sid = entry.slice(0, -'.json'.length);
     const body = readLease(filePath);
     if (!body) continue; // vanished mid-scan or corrupt -> leave for a later pass
 
     const staleByTime = nowMs - body.renewed_ms > sessionStaleSeconds * 1000;
     if (!staleByTime || body.uid !== uid || isAlive(body.pid)) continue;
+
+    // A tombstone means --clear-sid owns this sid right now; its cascade is
+    // that command's job, not ours.
+    if (fs.existsSync(path.join(sessionsDir, `${sid}.tombstone`))) continue;
+
+    const failedTargets = cascadeTargets(stateDir, sid)
+      .filter((t) => !deleteTarget(t))
+      .map((t) => t.p);
+    if (failedTargets.length > 0) {
+      if (onEvent) onEvent({ event: 'sessions_gc_partial', sid, failed_targets: failedTargets });
+      continue; // keep the lease; next pass retries the cascade
+    }
 
     // Re-verify immediately before deleting: only remove the exact stale
     // entry we just evaluated, in case a new (live) lease replaced it
@@ -134,4 +180,38 @@ function gcSessions(stateDir, { nowMs, uid, sessionStaleSeconds = 86400 }) {
   }
 }
 
-module.exports = { ensureSessionLease, gcSessions, SidCollisionError };
+// Orphan tombstone sweep (PRD R6 #5b): a --clear-sid crash can leak a
+// tombstone with no surviving siblings. Own-uid, aged past
+// tombstone_stale_seconds, and every sibling absent → unlink.
+function sweepOrphanTombstones(stateDir, { nowMs, uid, tombstoneStaleSeconds = 3600 }) {
+  const sessionsDir = path.join(stateDir, 'sessions');
+  let names = [];
+  try {
+    names = fs.readdirSync(sessionsDir).filter((f) => f.endsWith('.tombstone'));
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    const sid = name.slice(0, -'.tombstone'.length);
+    const p = path.join(sessionsDir, name);
+    let body;
+    try {
+      body = JSON.parse(fs.readFileSync(p, 'utf8'));
+    } catch {
+      continue; // unreadable/corrupt: leave for manual inspection
+    }
+    if (!body || body.cleared_by_uid !== uid) continue; // foreign: never touch
+    if (nowMs - body.ts_ms < tombstoneStaleSeconds * 1000) continue;
+    const lease = path.join(sessionsDir, `${sid}.json`);
+    const siblings = cascadeTargets(stateDir, sid).filter((t) => !t.p.endsWith('.tombstone'));
+    const anyLeft = fs.existsSync(lease) || siblings.some((t) => fs.existsSync(t.p));
+    if (anyLeft) continue;
+    try {
+      fs.unlinkSync(p);
+    } catch {
+      // raced -> fine
+    }
+  }
+}
+
+module.exports = { ensureSessionLease, gcSessions, sweepOrphanTombstones, SidCollisionError };
