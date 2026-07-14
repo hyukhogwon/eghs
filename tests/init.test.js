@@ -61,10 +61,20 @@ test('eghs-init --repair keeps a healthy fs-info.json untouched (no re-probe)', 
   const repo = mkTmpRepo();
   run([], repo);
   const infoPath = path.join(repo, '.claude', 'state', 'eghs', 'fs-info.json');
-  const custom = JSON.stringify({ schema_version: 1, caseless_fs: false, ts_ms: 42 });
-  fs.writeFileSync(infoPath, custom);
+  const healthy = fs.readFileSync(infoPath, 'utf8'); // real probe output = healthy v2
   run(['--repair'], repo);
-  assert.equal(fs.readFileSync(infoPath, 'utf8'), custom);
+  assert.equal(fs.readFileSync(infoPath, 'utf8'), healthy);
+});
+
+test('eghs-init --repair re-probes a legacy pre-R20 v1 fs-info.json (unhealthy cache, PRD Case 4)', () => {
+  const repo = mkTmpRepo();
+  run([], repo);
+  const infoPath = path.join(repo, '.claude', 'state', 'eghs', 'fs-info.json');
+  fs.writeFileSync(infoPath, JSON.stringify({ schema_version: 1, caseless_fs: false, ts_ms: 42 }));
+  run(['--repair'], repo);
+  const body = JSON.parse(fs.readFileSync(infoPath, 'utf8'));
+  assert.equal(body.flock_ok, true);
+  assert.equal(typeof body.fs_st_dev, 'number');
 });
 
 test('eghs-init survives stale probe leftovers from a crashed previous run', () => {

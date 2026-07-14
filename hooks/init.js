@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const { resolveStateDir, STATE_SUBDIRS } = require('./lib/state-dir');
 const { readSchemaVersion, HOOK_SCHEMA_VERSION } = require('./lib/schema');
-const { readFsInfo, probeAndWriteFsInfo } = require('./lib/fs-info');
+const { readFsInfo, probeAndWriteFsInfo, FlockUnsupportedError } = require('./lib/fs-info');
 const { atomicWriteFile } = require('./lib/atomic-write');
 const { getRepoRoot } = require('./lib/git');
 
@@ -73,9 +73,22 @@ function main(argv) {
     // Probe before schema_version: schema presence is the single "all infra
     // ready" signal (PRD §R2.5 init step 7), so fs-info.json must exist first.
     // A healthy cache is kept as-is — the filesystem's case behavior can't
-    // change under a live state dir, so --repair only fixes missing/corrupt.
+    // change under a live state dir, so --repair only fixes missing/unhealthy
+    // (PRD Cases 3/4: legacy v1 cache, corruption, FS move all re-probe).
     if (readFsInfo(stateDir).status !== 'ok') {
-      probeAndWriteFsInfo(stateDir, Date.now());
+      fs.rmSync(path.join(stateDir, 'fs-info.json'), { force: true }); // Case 4: unlink before re-probe
+      try {
+        probeAndWriteFsInfo(stateDir, Date.now());
+      } catch (err) {
+        if (err instanceof FlockUnsupportedError) {
+          // PRD init step 6c: fail-closed — guard rwlock and admin mutex
+          // correctness depend on real flock semantics.
+          process.stderr.write(`[eghs-init] ${err.message}\n`);
+          releaseLock();
+          process.exit(1);
+        }
+        throw err;
+      }
     }
 
     if (before.status === 'invalid' || before.status === 'not_initialized') {
