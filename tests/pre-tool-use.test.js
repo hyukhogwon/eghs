@@ -103,16 +103,26 @@ test('malformed stdin JSON never blocks the tool (exit 0, stderr note)', () => {
   assert.match(stderr, /\[eghs\]/);
 });
 
-test('missing/invalid session_id skips with a NO_SESSION stderr note, exit 0', () => {
+test('P4: missing/invalid session_id fail-closed BLOCKS Edit (exit 2, NO_SESSION)', () => {
   const repo = mkRepo();
   const file = path.join(repo, 'a.txt');
   fs.writeFileSync(file, 'x');
   const input = toolInput('Edit', file);
   input.session_id = 'not-a-uuid';
   const { exitCode, stderr } = runHook(repo, input);
-  assert.equal(exitCode, 0);
+  assert.equal(exitCode, 2);
   assert.match(stderr, /NO_SESSION/);
+  assert.match(stderr, /sid=none/);
   assert.ok(!fs.existsSync(path.join(repo, '.claude', 'state', 'eghs', 'pre', 'not-a-uuid')));
+});
+
+test('P4: NO_SESSION on Read also fail-closed blocks (exit 2, G1)', () => {
+  const repo = mkRepo();
+  const file = path.join(repo, 'a.txt');
+  fs.writeFileSync(file, 'x');
+  const input = toolInput('Read', file);
+  input.session_id = 'nope';
+  assert.equal(runHook(repo, input).exitCode, 2);
 });
 
 test('kill switch and CI passthrough skip recording entirely', () => {
@@ -126,14 +136,15 @@ test('kill switch and CI passthrough skip recording entirely', () => {
   assert.equal(preFiles(repo, 'write').length, 0);
 });
 
-test('uninitialized state dir skips recording without blocking (exit 0)', () => {
+test('P4: uninitialized state dir blocks Edit with SCHEMA_NOT_INITIALIZED (exit 2, auto-unblock Yes)', () => {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'eghs-pretool-bare-')));
   execFileSync('git', ['init', '-q'], { cwd: dir });
   const file = path.join(dir, 'a.txt');
   fs.writeFileSync(file, 'x');
-  const { exitCode, stdout } = runHook(dir, toolInput('Edit', file));
-  assert.equal(exitCode, 0);
-  assert.equal(stdout, '');
+  const { exitCode, stderr } = runHook(dir, toolInput('Edit', file));
+  assert.equal(exitCode, 2);
+  assert.match(stderr, /SCHEMA_NOT_INITIALIZED/);
+  assert.match(stderr, /eghs-init/);
   assert.ok(!fs.existsSync(path.join(dir, '.claude', 'state', 'eghs', 'pre')));
 });
 
@@ -159,4 +170,71 @@ test('pre-files older than 24h are GCed on the next hook invocation', () => {
   fs.writeFileSync(other, 'y');
   runHook(repo, toolInput('Read', other));
   assert.ok(!fs.existsSync(path.join(dir, stale)));
+});
+
+// ---- P4 unit 9: live R3 gate (state_gate_paths configured) ----
+
+const crypto2 = require('crypto');
+
+function writeConfig(repo, gatePaths) {
+  fs.writeFileSync(
+    path.join(repo, '.claude', 'eghs.config.json'),
+    JSON.stringify({ state_gate_paths: gatePaths })
+  );
+}
+
+function readState(repo, file) {
+  const info = JSON.parse(fs.readFileSync(path.join(repo, '.claude', 'state', 'eghs', 'fs-info.json'), 'utf8'));
+  const key = info.caseless_fs ? fs.realpathSync(file).toLowerCase() : fs.realpathSync(file);
+  const { createHash } = require('crypto');
+  const hash = createHash('sha1').update(key).digest('hex');
+  const p = path.join(repo, '.claude', 'state', 'eghs', 'reads', `${hash}.json`);
+  return { key, statePath: p };
+}
+
+test('gate ON, gated file with no read evidence → BLOCK UNREAD_OR_STALE (exit 2)', () => {
+  const repo = mkRepo();
+  writeConfig(repo, ['**/*.ts']);
+  const file = path.join(repo, 'src.ts');
+  fs.writeFileSync(file, 'code');
+  const { exitCode, stderr } = runHook(repo, toolInput('Edit', file));
+  assert.equal(exitCode, 2);
+  assert.match(stderr, /UNREAD_OR_STALE/);
+});
+
+test('gate ON, non-gated file → record-only allow (exit 0), pre-file written', () => {
+  const repo = mkRepo();
+  writeConfig(repo, ['**/*.ts']);
+  const file = path.join(repo, 'notes.md'); // not matched
+  fs.writeFileSync(file, 'x');
+  const { exitCode } = runHook(repo, toolInput('Edit', file));
+  assert.equal(exitCode, 0);
+  assert.equal(preFiles(repo, 'write').length, 1);
+});
+
+test('gate ON, Read then Edit on a gated file passes (allow, pre_sha recorded)', () => {
+  const repo = mkRepo();
+  writeConfig(repo, ['**/*.ts']);
+  const file = path.join(repo, 'src.ts');
+  fs.writeFileSync(file, 'code');
+  // Simulate the full Read cycle: PreToolUse Read + PostToolUse Read record.
+  runHook(repo, toolInput('Read', file));
+  const POST = path.join(__dirname, '..', 'hooks', 'post-tool-use.js');
+  spawnSync('node', [POST], { cwd: repo, input: JSON.stringify({ ...toolInput('Read', file), tool_response: { type: 'text', file: {} } }), encoding: 'utf8', env: process.env });
+  // Now Edit must be allowed.
+  const { exitCode } = runHook(repo, toolInput('Edit', file));
+  assert.equal(exitCode, 0);
+  assert.equal(preFiles(repo, 'write').length, 1);
+  assert.equal(preFiles(repo, 'write')[0].pre_sha, crypto2.createHash('sha256').update('code').digest('hex'));
+});
+
+test('gate ON, new-file Write on a gated path is allowed (pre_sha null, R4 handles)', () => {
+  const repo = mkRepo();
+  writeConfig(repo, ['**/*.ts']);
+  const file = path.join(repo, 'fresh.ts'); // does not exist
+  const { exitCode } = runHook(repo, toolInput('Write', file));
+  assert.equal(exitCode, 0);
+  const recs = preFiles(repo, 'write');
+  assert.equal(recs.length, 1);
+  assert.equal(recs[0].pre_sha, null);
 });

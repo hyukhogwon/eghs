@@ -1,17 +1,88 @@
 #!/usr/bin/env node
 'use strict';
+const fs = require('fs');
 const { readStdin } = require('./lib/stdin');
-const { resolveToolHookContext, isOutsideRepo } = require('./lib/tool-hook');
-const { canonicalKey, canonicalKeyAllowMissing, sha256File } = require('./lib/canonical');
-const { writePreFile, gcPreFiles, normalizeToolUseId } = require('./lib/pre-file');
+const { runPrecedence } = require('./lib/precedence');
+const { evaluateGate } = require('./lib/gate');
+const { canonicalKey, sha256File } = require('./lib/canonical');
+const { writePreFile, deletePreFile, normalizeToolUseId } = require('./lib/pre-file');
 const { appendDebugLog } = require('./lib/debug-log');
+const { formatBlock } = require('./lib/deny');
 
-// P3 PreToolUse is RECORD-ONLY: the R3 gate is off, so this hook ALWAYS
-// exits 0 — an exit 2 here would deny the tool call itself. Every abnormal
-// path degrades to "skip recording", optionally with a stderr note.
+// P4 PreToolUse GATES Write/Edit/MultiEdit (PRD §R3): a deny is exit 2, which
+// Claude Code turns into a blocked tool call + the stderr reason relayed to
+// the model. Read is not gated but still fails closed on NO_SESSION (G1).
 process.stdout.on('error', () => {});
 
-const TOOL_KINDS = { Read: 'read', Write: 'write', Edit: 'write', MultiEdit: 'write' };
+const TOOL_KINDS = { Read: 'pre-read', Write: 'pre-write', Edit: 'pre-write', MultiEdit: 'pre-write' };
+
+function block(denyCode, { reason, sid }) {
+  process.stderr.write(formatBlock(denyCode, { reason, sid }));
+  process.exitCode = 2;
+}
+
+// PreToolUse Read: record the pre-edit SHA for R2 TOCTOU comparison. Not
+// gated — this only ever produces evidence.
+function recordRead(ctx, input, nowMs, toolUseId) {
+  const resolved = canonicalKey(input.tool_input.file_path, { caseless: ctx.caseless });
+  if (!resolved.ok) {
+    appendDebugLog(ctx.stateDir, ctx.sid, { ts_ms: nowMs, hook: 'PreToolUse', tool: input.tool_name, decision: 'skip', deny_code: 'FILE_UNREADABLE' });
+    return;
+  }
+  const hashed = sha256File(resolved.key);
+  if (!hashed.ok) {
+    appendDebugLog(ctx.stateDir, ctx.sid, { ts_ms: nowMs, hook: 'PreToolUse', tool: input.tool_name, decision: 'skip', deny_code: 'FILE_UNREADABLE' });
+    return;
+  }
+  writePreFile(ctx.stateDir, ctx.sid, resolved.key, toolUseId, 'read', { sha: hashed.sha, ts_ms: nowMs, pretool_sid: ctx.sid });
+  appendDebugLog(ctx.stateDir, ctx.sid, { ts_ms: nowMs, hook: 'PreToolUse', tool: input.tool_name, decision: 'record', deny_code: null });
+}
+
+function logPre(ctx, input, nowMs, fields) {
+  appendDebugLog(ctx.stateDir, ctx.sid, { ts_ms: nowMs, hook: 'PreToolUse', tool: input.tool_name, ...fields });
+}
+
+// PreToolUse Write/Edit/MultiEdit: the R3 gate. Returns a deny descriptor
+// {denyCode, reason} to block, or null to allow (having recorded pre_sha).
+// evaluateGate resolves the canonical key once and hands it back.
+function handleWriteGate(ctx, input, nowMs, toolUseId) {
+  const gate = evaluateGate(ctx, input.tool_input.file_path, { nowMs });
+
+  if (gate.skip === 'outside_repo') {
+    logPre(ctx, input, nowMs, { decision: 'skip', deny_code: null, gate_applicable: false });
+    return null; // out of EGHS scope: allow, record nothing
+  }
+
+  if (gate.allow) {
+    // Matched-and-passed (preSha=state.sha) OR new-file Write (preSha=null).
+    writePreFile(ctx.stateDir, ctx.sid, gate.key, toolUseId, 'write', { pre_sha: gate.preSha, ts_ms: nowMs, pretool_sid: ctx.sid });
+    logPre(ctx, input, nowMs, { decision: 'allow', deny_code: null, gate_applicable: true, has_gate_passing_state: gate.preSha !== null });
+    return null;
+  }
+
+  if (gate.skip === 'not_applicable') {
+    // In-repo, non-gated path: record-only (like P3). pre_sha from disk, or
+    // null for a not-yet-existing file.
+    let preSha = null;
+    if (!gate.missing) {
+      const hashed = sha256File(gate.key);
+      if (!hashed.ok) {
+        logPre(ctx, input, nowMs, { decision: 'skip', deny_code: 'FILE_UNREADABLE', gate_applicable: false });
+        return null;
+      }
+      preSha = hashed.sha;
+    }
+    writePreFile(ctx.stateDir, ctx.sid, gate.key, toolUseId, 'write', { pre_sha: preSha, ts_ms: nowMs, pretool_sid: ctx.sid });
+    logPre(ctx, input, nowMs, { decision: 'record', deny_code: null, gate_applicable: false });
+    return null;
+  }
+
+  // Deny. Delete any pre-file left by a prior invocation so no stale pre_sha
+  // survives (PRD §496).
+  if (gate.key) deletePreFile(ctx.stateDir, ctx.sid, gate.key, toolUseId, 'write');
+  logPre(ctx, input, nowMs, { decision: 'block', deny_code: gate.denyCode, gate_applicable: true });
+  return { denyCode: gate.denyCode, reason: gate.reason };
+}
 
 function main() {
   let input;
@@ -19,67 +90,46 @@ function main() {
     const raw = readStdin();
     input = raw ? JSON.parse(raw) : {};
   } catch (err) {
-    process.stderr.write(`[eghs] pre-tool-use: stdin parse failed (skip): ${err.message}\n`);
+    // INPUT_PARSE (auto-unblock=Yes): a malformed hook payload is a harness
+    // fault, not a gate-bypass — fail soft rather than brick every tool call.
+    process.stderr.write(`[eghs] pre-tool-use: stdin parse failed (allow): ${err.message}\n`);
     return;
   }
 
-  const kind = TOOL_KINDS[input.tool_name];
+  const hookKind = TOOL_KINDS[input.tool_name];
   const filePath = input.tool_input && input.tool_input.file_path;
-  if (!kind || typeof filePath !== 'string') return;
-
-  const ctx = resolveToolHookContext(input, {
-    env: process.env,
-    cwd: process.cwd(),
-    hookName: 'pre-tool-use',
-  });
-  if (ctx.skip) return;
+  if (!hookKind || typeof filePath !== 'string') return; // not our tool: allow
 
   const nowMs = Date.now();
   const toolUseId = normalizeToolUseId(input.tool_use_id);
-  gcPreFiles(ctx.stateDir, { nowMs });
+  const result = runPrecedence(hookKind, input, { env: process.env, cwd: process.cwd(), nowMs });
 
-  const resolved =
-    kind === 'write'
-      ? canonicalKeyAllowMissing(filePath, { caseless: ctx.caseless })
-      : canonicalKey(filePath, { caseless: ctx.caseless });
-  if (!resolved.ok) {
-    appendDebugLog(ctx.stateDir, ctx.sid, { ts_ms: nowMs, hook: 'PreToolUse', tool: input.tool_name, decision: 'skip', deny_code: 'FILE_UNREADABLE' });
+  if (result.outcome === 'exit0') return; // kill switch / CI / fail-soft skip
+  if (result.outcome === 'deny') {
+    // NO_SESSION has no valid sid to surface for --clear-sid → sid=none.
+    const sid = result.denyCode === 'NO_SESSION' ? null : input.session_id;
+    block(result.denyCode, { reason: result.reason, sid });
     return;
   }
 
-  if (isOutsideRepo(resolved.key, ctx.repoRoot, ctx.caseless)) {
-    appendDebugLog(ctx.stateDir, ctx.sid, { ts_ms: nowMs, hook: 'PreToolUse', tool: input.tool_name, decision: 'skip', deny_code: null });
-    return;
-  }
-
-  if (kind === 'read') {
-    const hashed = sha256File(resolved.key);
-    if (!hashed.ok) {
-      appendDebugLog(ctx.stateDir, ctx.sid, { ts_ms: nowMs, hook: 'PreToolUse', tool: input.tool_name, decision: 'skip', deny_code: 'FILE_UNREADABLE' });
-      return;
+  // continue: ctx carries a live lease and the shared guard (held open).
+  const ctx = result.ctx;
+  try {
+    if (hookKind === 'pre-read') {
+      recordRead(ctx, input, nowMs, toolUseId);
+    } else {
+      const deny = handleWriteGate(ctx, input, nowMs, toolUseId);
+      if (deny) block(deny.denyCode, { reason: deny.reason, sid: ctx.sid });
     }
-    writePreFile(ctx.stateDir, ctx.sid, resolved.key, toolUseId, 'read', { sha: hashed.sha, ts_ms: nowMs, pretool_sid: ctx.sid });
-  } else {
-    let preSha = null;
-    if (!resolved.missing) {
-      const hashed = sha256File(resolved.key);
-      if (!hashed.ok) {
-        // Existing-but-unhashable file: recording pre_sha null would make R4
-        // misclassify the edit as a new-file success. Skip instead.
-        appendDebugLog(ctx.stateDir, ctx.sid, { ts_ms: nowMs, hook: 'PreToolUse', tool: input.tool_name, decision: 'skip', deny_code: 'FILE_UNREADABLE' });
-        return;
-      }
-      preSha = hashed.sha;
-    }
-    writePreFile(ctx.stateDir, ctx.sid, resolved.key, toolUseId, 'write', { pre_sha: preSha, ts_ms: nowMs, pretool_sid: ctx.sid });
+  } finally {
+    if (typeof ctx.guardFd === 'number') fs.closeSync(ctx.guardFd);
   }
-  appendDebugLog(ctx.stateDir, ctx.sid, { ts_ms: nowMs, hook: 'PreToolUse', tool: input.tool_name, decision: 'record', deny_code: null });
 }
 
 try {
   main();
 } catch (err) {
-  // Fail-soft backstop: record-only hooks must never block a tool call.
-  process.stderr.write(`[eghs] pre-tool-use hook error (fail-soft): ${err.stack || err.message}\n`);
+  // Fail-soft backstop: an unexpected crash must not brick the tool call.
+  process.stderr.write(`[eghs] pre-tool-use hook error (fail-soft, allow): ${err.stack || err.message}\n`);
+  process.exitCode = 0;
 }
-process.exitCode = 0;
