@@ -146,6 +146,15 @@ test('gcSessions keeps leases that are dead but not yet past the staleness windo
   assert.ok(fs.existsSync(path.join(stateDir, 'sessions', 'sid-recent-dead.json')));
 });
 
+test('gcSessions skips a corrupt (unparseable) lease without throwing (P4 unit 10)', () => {
+  const stateDir = mkStateDir();
+  fs.writeFileSync(path.join(stateDir, 'sessions', 'sid-corrupt.json'), '{ not json');
+  // Pre-fix this threw a SyntaxError out of the precedence GC pass, crashing
+  // the calling hook. A corrupt lease is unclassifiable → leave it alone.
+  gcSessions(stateDir, { nowMs: 999_999_999, uid: process.getuid(), sessionStaleSeconds: 86400 });
+  assert.equal(fs.readFileSync(path.join(stateDir, 'sessions', 'sid-corrupt.json'), 'utf8'), '{ not json');
+});
+
 test('gcSessions keeps a stale dead-pid lease belonging to a different uid', () => {
   const stateDir = mkStateDir();
   fs.writeFileSync(

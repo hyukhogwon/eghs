@@ -190,12 +190,13 @@ test('guards: kill switch, CI, NO_SESSION, uninitialized state all skip with exi
   assert.ok(!fs.existsSync(path.join(bare, '.claude', 'state', 'eghs', 'reads')));
 });
 
-test('an unavailable session lease leaves a sid-scoped lease_unavailable marker, no state', () => {
+test('P4: a live foreign lease under this sid (SID_COLLISION) skips read recording with no marker', () => {
   const repo = mkRepo();
   const file = path.join(repo, 'l2.txt');
   fs.writeFileSync(file, 'x');
-  // A live foreign pid (1 = launchd/init) holding this sid forces a
-  // SID_COLLISION out of ensureSessionLease.
+  // A live foreign pid (1 = launchd/init) holding this sid is a SID_COLLISION
+  // candidate out of precedence #6; the R6 #4 matrix row for PostToolUse Read
+  // is "state write skip, exit 0" — read-only fallback, no marker.
   const sessions = path.join(repo, '.claude', 'state', 'eghs', 'sessions');
   fs.writeFileSync(
     path.join(sessions, `${SID}.json`),
@@ -204,13 +205,26 @@ test('an unavailable session lease leaves a sid-scoped lease_unavailable marker,
   const { exitCode } = runHook(POST_HOOK, repo, readInput(file));
   assert.equal(exitCode, 0);
   assert.equal(readState(repo, file), null);
-  const marker = JSON.parse(
-    fs.readFileSync(
-      path.join(repo, '.claude', 'state', 'eghs', 'failed', SID, `${keyHash(canonKey(repo, file))}.json`),
-      'utf8'
+  assert.ok(
+    !fs.existsSync(
+      path.join(repo, '.claude', 'state', 'eghs', 'failed', SID, `${keyHash(canonKey(repo, file))}.json`)
     )
   );
-  assert.equal(marker.reason, 'lease_unavailable');
+});
+
+test('P4: live migrate.lock on PostToolUse Read → skip (exit 0), no marker, no state', () => {
+  const repo = mkRepo();
+  const file = path.join(repo, 'mig-read.txt');
+  fs.writeFileSync(file, 'x');
+  fs.writeFileSync(
+    path.join(repo, '.claude', 'state', 'eghs', 'migrate.lock'),
+    JSON.stringify({ pid: process.pid, uid: process.getuid(), start_ms: Date.now() })
+  );
+  const { exitCode, stdout } = runHook(POST_HOOK, repo, readInput(file));
+  assert.equal(exitCode, 0);
+  assert.equal(stdout, '');
+  assert.equal(readState(repo, file), null);
+  assert.ok(!fs.existsSync(path.join(repo, '.claude', 'state', 'eghs', 'failed', SID)));
 });
 
 test('malformed stdin and a corrupt eghs.config.json both skip without crashing', () => {

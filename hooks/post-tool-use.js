@@ -3,21 +3,23 @@
 const fs = require('fs');
 const path = require('path');
 const { readStdin } = require('./lib/stdin');
-const { resolveToolHookContext, isOutsideRepo } = require('./lib/tool-hook');
-const { loadConfig } = require('./lib/config');
+const { runPrecedence } = require('./lib/precedence');
+const { isOutsideRepo } = require('./lib/tool-hook');
 const { canonicalKey, canonicalKeyAllowMissing, keyHash, sha256File } = require('./lib/canonical');
 const { isAlive } = require('./lib/proc');
 const { writeReadState, writeFailedMarker, clearMarkersOnSuccess } = require('./lib/read-state');
-const { readPreFile, deletePreFile, gcPreFiles, normalizeToolUseId, listPreFilesForHash } = require('./lib/pre-file');
-const { ensureSessionLease } = require('./lib/session');
+const { readPreFile, deletePreFile, normalizeToolUseId, listPreFilesForHash } = require('./lib/pre-file');
 const { appendDebugLog } = require('./lib/debug-log');
+const { resolveStateDir } = require('./lib/state-dir');
+const { readFsInfo } = require('./lib/fs-info');
+const { getRepoRoot } = require('./lib/git');
 
-// P3 PostToolUse is RECORD-ONLY: the gate is off, so this hook ALWAYS exits
-// 0 — the tool call already ran, and P3's job is only to write evidence.
-// Every abnormal path degrades to "skip recording".
+// P4 PostToolUse ALWAYS exits 0 (PRD §R4): the tool call already ran, so
+// there is nothing left to block — every abnormal precedence outcome degrades
+// to a fail-closed sid-scoped marker (Write tools) or a plain skip (Read).
 process.stdout.on('error', () => {});
 
-const WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit']);
+const TOOL_KINDS = { Read: 'post-read', Write: 'post-write', Edit: 'post-write', MultiEdit: 'post-write' };
 
 function skipLog(ctx, input, nowMs, denyCode) {
   appendDebugLog(ctx.stateDir, ctx.sid, {
@@ -296,6 +298,28 @@ function handleWrite(ctx, input, lease, nowMs) {
   });
 }
 
+// R6 #4 hook-type matrix, PostToolUse Write/Edit/MultiEdit row (PRD §755):
+// a deny candidate becomes a fail-closed sid-scoped marker
+// `failed/<sid>/<sha1(key)>.json` (reason = the candidate's marker reason) and
+// the own pre-file is unlinked, then exit 0 — the next PreToolUse blocks with
+// STATE_RECORD_FAILED, the accurate root cause. Best-effort by contract: the
+// precedence chain already settled (guard released), and a lost marker only
+// weakens the next gate check, never the tool call that already ran.
+// ctx is unavailable on this outcome, so stateDir/caseless are re-derived;
+// with fs-info itself broken the caseless flag falls back to null (raw
+// realpath key) — accepted precision loss on a best-effort write.
+function writeFailClosedMarker(input, markerReason, nowMs) {
+  const sid = input.session_id; // strict-valid: marker_exit0 only exists past #3.5
+  const stateDir = resolveStateDir(getRepoRoot(process.cwd()) || process.cwd());
+  const fsInfo = readFsInfo(stateDir);
+  const resolved = canonicalKeyAllowMissing(input.tool_input.file_path, {
+    caseless: fsInfo.status === 'ok' ? fsInfo.caseless : null,
+  });
+  if (!resolved.ok) return;
+  writeFailedMarker(stateDir, resolved.key, { sid, tsMs: nowMs, reason: markerReason, sidScoped: true });
+  deletePreFile(stateDir, sid, resolved.key, normalizeToolUseId(input.tool_use_id), 'write');
+}
+
 function main() {
   let input;
   try {
@@ -306,59 +330,32 @@ function main() {
     return;
   }
 
-  const isRead = input.tool_name === 'Read';
-  const isWrite = WRITE_TOOLS.has(input.tool_name);
+  const hookKind = TOOL_KINDS[input.tool_name];
   const filePath = input.tool_input && input.tool_input.file_path;
-  if ((!isRead && !isWrite) || typeof filePath !== 'string') return;
-
-  const ctx = resolveToolHookContext(input, {
-    env: process.env,
-    cwd: process.cwd(),
-    hookName: 'post-tool-use',
-  });
-  if (ctx.skip) return;
-
-  let config;
-  try {
-    config = loadConfig(ctx.repoRoot);
-  } catch (err) {
-    process.stderr.write(`[eghs] post-tool-use: ${err.message} (recording skipped)\n`);
-    return;
-  }
+  if (!hookKind || typeof filePath !== 'string') return; // not our tool: skip
 
   const nowMs = Date.now();
-  gcPreFiles(ctx.stateDir, { nowMs });
+  const result = runPrecedence(hookKind, input, { env: process.env, cwd: process.cwd(), nowMs });
 
-  // Lease create/renew (PRD §R6 #6): marker policies compare against the
-  // session's start_ms, so evidence writes require a live lease.
-  let lease;
-  try {
-    lease = ensureSessionLease(ctx.stateDir, ctx.sid, {
-      pid: process.ppid,
-      uid: process.getuid(),
-      nowMs,
-    });
-  } catch (err) {
-    // R6: lease failure surfaces as a sid-scoped lease_unavailable marker —
-    // this sid's evidence for the file is unprovable, but no other session
-    // is affected. allowMissing covers new-file Write intents too.
-    const resolved = canonicalKeyAllowMissing(filePath, { caseless: ctx.caseless });
-    if (resolved.ok) {
-      writeFailedMarker(ctx.stateDir, resolved.key, {
-        sid: ctx.sid,
-        tsMs: nowMs,
-        reason: 'lease_unavailable',
-        sidScoped: true,
-      });
-    }
-    process.stderr.write(`[eghs] post-tool-use: session lease unavailable (skip): ${err.message}\n`);
+  if (result.outcome === 'marker_exit0') {
+    writeFailClosedMarker(input, result.markerReason, nowMs);
     return;
   }
+  // exit0 covers kill switch / CI / NO_SESSION short-circuit (R4 §512) / all
+  // post-read fallback rows. 'deny' never reaches PostToolUse by the #4
+  // matrix; if it ever did, skipping is the only always-exit-0-safe move.
+  if (result.outcome !== 'continue') return;
 
-  if (isRead) {
-    handleRead(ctx, input, config, lease, nowMs);
-  } else {
-    handleWrite(ctx, input, lease, nowMs);
+  // continue: healthy state, ctx carries the live lease and the shared guard.
+  const ctx = result.ctx;
+  try {
+    if (hookKind === 'post-read') {
+      handleRead(ctx, input, ctx.config, ctx.lease, nowMs);
+    } else {
+      handleWrite(ctx, input, ctx.lease, nowMs);
+    }
+  } finally {
+    if (typeof ctx.guardFd === 'number') fs.closeSync(ctx.guardFd);
   }
 }
 

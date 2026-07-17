@@ -1,17 +1,15 @@
 #!/usr/bin/env node
 'use strict';
+const fs = require('fs');
+const path = require('path');
 const { readStdin } = require('./lib/stdin');
+const { runPrecedence } = require('./lib/precedence');
 const { resolveStateDir } = require('./lib/state-dir');
-const { readSchemaVersion } = require('./lib/schema');
-const { checkKillSwitch } = require('./lib/kill-switch');
-const { loadConfig } = require('./lib/config');
 const { getRepoRoot } = require('./lib/git');
 const { acquireStopLock } = require('./lib/lock');
-const { ensureSessionLease, gcSessions, SidCollisionError } = require('./lib/session');
-const { ensureBaseline } = require('./lib/baseline');
 const { runVerification } = require('./lib/verify');
 const { appendDebugLog } = require('./lib/debug-log');
-const { isValidSid } = require('./lib/sid');
+const { formatBlock } = require('./lib/deny');
 
 function emit(exitCode, decision, extra) {
   // Claude Code's Stop-hook contract: exit 0 + EMPTY stdout allows the stop
@@ -33,90 +31,21 @@ function emit(exitCode, decision, extra) {
   process.exitCode = exitCode;
 }
 
-async function main() {
-  // Recursion guard — checked before anything else touches disk (PRD §R5).
-  if (process.env.STOP_HOOK_ACTIVE === '1') {
-    emit(0, { decision: 'allow', reason: 'recursion guard (env)' });
-    return;
-  }
+// #8 Stop hook logic (verification), entered only on a precedence 'continue'.
+// PRD §826: the MISMATCH/FS_INFO_MISSING continue rows carry no lease or
+// baseline — verification is state-independent there, so the diff base falls
+// back to HEAD when baselines/<sid>.txt is unreadable.
+async function runStopLogic(ctx, nowMs) {
+  const { stateDir, sid, repoRoot, config } = ctx;
 
-  let input;
+  let baselineCommit = null;
   try {
-    const raw = readStdin();
-    input = raw ? JSON.parse(raw) : {};
+    baselineCommit = JSON.parse(fs.readFileSync(path.join(stateDir, 'baselines', `${sid}.txt`), 'utf8')).commit;
   } catch {
-    emit(2, { decision: 'block', deny_code: 'INPUT_PARSE', reason: 'malformed stdin JSON' });
-    return;
+    // MISMATCH/FS_INFO_MISSING continue rows: no baseline exists by design.
   }
-
-  if (input.stop_hook_active === true) {
-    emit(0, { decision: 'allow', reason: 'recursion guard (input field)' });
-    return;
-  }
-
-  const repoRoot = getRepoRoot(process.cwd()) || process.cwd();
-  const stateDir = resolveStateDir(repoRoot);
-
-  // Precedence #2: kill switch (stat/env only, no mutation).
-  const killSwitch = checkKillSwitch({ repoRoot, env: process.env });
-  if (killSwitch.active) {
-    process.stderr.write(`[eghs] kill-switch active: ${killSwitch.reason}\n`);
-    emit(0, { decision: 'allow', reason: `kill-switch:${killSwitch.reason}` });
-    return;
-  }
-
-  // Precedence #1/#7 (P1 scope: no eghs-migrate CLI exists, so migrate.lock
-  // is never written — only NOT_INITIALIZED/INVALID block Stop; PRD §R6 #7,
-  // MISMATCH/FS_INFO_MISSING are treated identically to healthy for Stop).
-  const schema = readSchemaVersion(stateDir);
-  if (schema.status === 'not_initialized' || schema.status === 'invalid') {
-    emit(2, {
-      decision: 'block',
-      deny_code: 'INFRA_NOT_READY',
-      reason: 'eghs state dir missing or corrupt — run `node hooks/init.js`',
-    });
-    return;
-  }
-
-  const sid = input.session_id;
-  if (!isValidSid(sid)) {
-    // NO_SESSION signal (PRD §R2.5): allow, but skip all state work.
-    // This is a fail-open path, and Claude Code only guarantees session_id
-    // is a string (not UUIDv4) — keep it observable on stderr so a host-side
-    // format change doesn't silently disable gating forever.
-    process.stderr.write(`[eghs] NO_SESSION: missing/invalid session_id — verification gating skipped\n`);
-    emit(0, { decision: 'allow', reason: 'no valid session_id (NO_SESSION)' });
-    return;
-  }
-
-  const nowMs = Date.now();
-  const uid = process.getuid();
-  // The direct parent is the closest thing to a host pid we get: no
-  // CLAUDE_CODE_PID-style env var exists (verified against Claude Code
-  // v2.1.198, 2026-07-02 spec audit). Lease staleness detection only needs
-  // a pid whose death implies the invoking session is gone.
-  const pid = process.ppid;
-
-  let lease;
-  let baseline;
-  try {
-    gcSessions(stateDir, { nowMs, uid });
-    lease = ensureSessionLease(stateDir, sid, { pid, uid, nowMs });
-    baseline = ensureBaseline(stateDir, sid, { lease, repoRoot });
-  } catch (err) {
-    const denyCode = err instanceof SidCollisionError ? 'SID_COLLISION' : 'INFRA_NOT_READY';
-    appendDebugLog(stateDir, sid, { ts_ms: nowMs, hook: 'Stop', decision: 'block', deny_code: denyCode });
-    emit(2, { decision: 'block', deny_code: denyCode, reason: err.message });
-    return;
-  }
-
-  let config;
-  try {
-    config = loadConfig(repoRoot);
-  } catch (err) {
-    emit(2, { decision: 'block', deny_code: 'INFRA_NOT_READY', reason: err.message });
-    return;
-  }
+  const diffBase =
+    config.diff_base === 'session_baseline' ? baselineCommit || 'NO_GIT' : config.diff_base;
 
   // Lock staleness budget must cover the worst-case verification runtime,
   // not a single command's timeout — sequential mode can legitimately run
@@ -129,8 +58,8 @@ async function main() {
     : config.verification_timeout_seconds * 1000 * Math.max(commandCount, 1);
 
   const lockResult = acquireStopLock(stateDir, sid, {
-    pid,
-    uid,
+    pid: process.ppid,
+    uid: process.getuid(),
     timeoutMs: lockTimeoutMs,
     nowMs,
   });
@@ -143,16 +72,12 @@ async function main() {
     return;
   }
 
-  // `emit()` used to call process.exit(), which would skip a pending
-  // `finally` — build the outcome inside try/finally and only emit after
-  // the lock has actually been released. Every branch below ASSIGNS
-  // `outcome` and falls through to the end of the try block rather than
-  // `return`ing early — an early `return` here previously skipped the
-  // single `emit()` call after the `finally`, silently exiting 0 instead
-  // of reporting the intended block decision.
+  // Every branch below ASSIGNS `outcome` and falls through to the end of the
+  // try block rather than `return`ing early — an early `return` here
+  // previously skipped the single `emit()` call after the `finally`,
+  // silently exiting 0 instead of reporting the intended block decision.
   let outcome;
   try {
-    const diffBase = config.diff_base === 'session_baseline' ? baseline.commit : config.diff_base;
     let result = null;
     let verifyError = null;
     try {
@@ -209,6 +134,70 @@ async function main() {
     lockResult.release();
   }
   emit(outcome.exitCode, outcome.decision, outcome.extra);
+}
+
+async function main() {
+  // Recursion guard — checked before anything else touches disk (PRD §R5).
+  if (process.env.STOP_HOOK_ACTIVE === '1') {
+    emit(0, { decision: 'allow', reason: 'recursion guard (env)' });
+    return;
+  }
+
+  let input;
+  try {
+    const raw = readStdin();
+    input = raw ? JSON.parse(raw) : {};
+  } catch {
+    emit(2, { decision: 'block', deny_code: 'INPUT_PARSE', reason: 'malformed stdin JSON' });
+    return;
+  }
+
+  if (input.stop_hook_active === true) {
+    emit(0, { decision: 'allow', reason: 'recursion guard (input field)' });
+    return;
+  }
+
+  // PRD §R6 precedence chain #1-#7. Stop is fail-closed: every deny is a real
+  // exit 2 block, and CI passthrough does NOT apply (G3, PRD §688) — the
+  // chain itself skips #3 for hookKind 'stop'.
+  const nowMs = Date.now();
+  const result = runPrecedence('stop', input, { env: process.env, cwd: process.cwd(), nowMs });
+
+  if (result.outcome === 'exit0') {
+    // Kill switch (the only exit0 row for Stop): allow with EMPTY stdout.
+    emit(0, { decision: 'allow', reason: result.reason });
+    return;
+  }
+
+  if (result.outcome === 'deny') {
+    // R6 #4 Stop row: MIGRATE_IN_PROGRESS is masked as INFRA_NOT_READY
+    // (auto-unblock=No — nothing may auto-pass when verification did not
+    // run); the ORIGINAL candidate goes to the debug log only. NO_SESSION
+    // has no sid, hence no debug path and sid=none in the block line.
+    const sid = result.denyCode === 'NO_SESSION' ? null : input.session_id;
+    if (typeof sid === 'string') {
+      const stateDir = resolveStateDir(getRepoRoot(process.cwd()) || process.cwd());
+      appendDebugLog(stateDir, sid, {
+        ts_ms: nowMs,
+        hook: 'Stop',
+        decision: 'block',
+        deny_code: result.denyCode,
+        ...(result.maskedFrom ? { masked_from: result.maskedFrom } : {}),
+      });
+    }
+    process.stderr.write(formatBlock(result.denyCode, { reason: result.reason, sid }));
+    process.exitCode = 2;
+    return;
+  }
+
+  // continue: ctx carries config, a lease when the schema was healthy, and
+  // the shared guard (held open through all #8 state mutation).
+  const ctx = result.ctx;
+  try {
+    await runStopLogic(ctx, nowMs);
+  } finally {
+    if (typeof ctx.guardFd === 'number') fs.closeSync(ctx.guardFd);
+  }
 }
 
 main().catch((err) => {

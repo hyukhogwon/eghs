@@ -149,8 +149,13 @@ function gcSessions(stateDir, { nowMs, uid, sessionStaleSeconds = 86400, onEvent
   for (const entry of entries) {
     const filePath = path.join(sessionsDir, entry);
     const sid = entry.slice(0, -'.json'.length);
-    const body = readLease(filePath);
-    if (!body) continue; // vanished mid-scan or corrupt -> leave for a later pass
+    let body;
+    try {
+      body = readLease(filePath);
+    } catch {
+      continue; // unparseable lease: unclassifiable, only --clear-sid may touch it
+    }
+    if (!body) continue; // vanished mid-scan -> leave for a later pass
 
     const staleByTime = nowMs - body.renewed_ms > sessionStaleSeconds * 1000;
     if (!staleByTime || body.uid !== uid || isAlive(body.pid)) continue;
@@ -170,7 +175,12 @@ function gcSessions(stateDir, { nowMs, uid, sessionStaleSeconds = 86400, onEvent
     // Re-verify immediately before deleting: only remove the exact stale
     // entry we just evaluated, in case a new (live) lease replaced it
     // between the read above and now.
-    const stillStale = readLease(filePath);
+    let stillStale;
+    try {
+      stillStale = readLease(filePath);
+    } catch {
+      continue; // replaced by something unreadable mid-scan: hands off
+    }
     if (!sameEntry(stillStale, body)) continue;
     try {
       fs.unlinkSync(filePath);

@@ -77,38 +77,61 @@ test('CI passthrough (CI=1) suppresses injection, exit 0', () => {
   assert.equal(stdout, '');
 });
 
-test('uninitialized state injects the init-guidance one-liner, exit 0', () => {
+test('P4: uninitialized state injects the R6 #7 init nudge as additionalContext, exit 0', () => {
   const repo = mkRepo(); // no initRepo()
-  const { stdout, code } = run(repo, { input: { session_id: SID } });
+  const { stdout, stderr, code } = run(repo, { input: { session_id: SID } });
   assert.equal(code, 0);
   const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
-  assert.match(ctx, /not initialized/);
-  assert.match(ctx, /hooks\/init\.js/);
+  assert.match(ctx, /eghs-init/);
+  assert.match(stderr, /state not ready/); // PRD §824: stderr warning too
 });
 
-test('invalid schema_version injects the init-guidance one-liner, exit 0', () => {
+test('P4: invalid schema_version injects the init nudge (fail-soft), exit 0', () => {
   const repo = mkRepo();
   initRepo(repo);
   fs.writeFileSync(path.join(repo, '.claude', 'state', 'eghs', 'schema_version'), '01\n');
   const { stdout, code } = run(repo, { input: { session_id: SID } });
   assert.equal(code, 0);
-  assert.match(JSON.parse(stdout).hookSpecificOutput.additionalContext, /not initialized/);
+  assert.match(JSON.parse(stdout).hookSpecificOutput.additionalContext, /eghs-init/);
 });
 
-test('malformed stdin still injects principles (best-effort parse), exit 0', () => {
+test('P4: malformed stdin degrades to NO_SESSION fail-soft — exit 0, NO injection (PRD §690)', () => {
   const repo = mkRepo();
   initRepo(repo);
   const { stdout, code } = run(repo, { rawInput: '{ not json' });
   assert.equal(code, 0);
-  assert.match(JSON.parse(stdout).hookSpecificOutput.additionalContext, /Read it first/);
+  assert.equal(stdout, '');
 });
 
-test('missing session_id still injects principles (P2 needs no sid), exit 0', () => {
+test('P4: missing session_id → exit 0 with NO additionalContext (R6 #3.5 UPS row)', () => {
   const repo = mkRepo();
   initRepo(repo);
   const { stdout, code } = run(repo, { input: {} });
   assert.equal(code, 0);
-  assert.match(JSON.parse(stdout).hookSpecificOutput.additionalContext, /Read it first/);
+  assert.equal(stdout, '');
+});
+
+test('P4: live migrate.lock injects a migrate-in-progress notice instead of principles', () => {
+  const repo = mkRepo();
+  initRepo(repo);
+  fs.writeFileSync(
+    path.join(repo, '.claude', 'state', 'eghs', 'migrate.lock'),
+    JSON.stringify({ pid: process.pid, uid: process.getuid(), start_ms: Date.now() })
+  );
+  const { stdout, code } = run(repo, { input: { session_id: SID } });
+  assert.equal(code, 0);
+  const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+  assert.match(ctx, /migrate in progress/);
+  assert.ok(!/Read it first/.test(ctx), 'discipline principles are skipped on this row');
+});
+
+test('P4: schema MISMATCH injects a migrate nudge (fail-soft), exit 0', () => {
+  const repo = mkRepo();
+  initRepo(repo);
+  fs.writeFileSync(path.join(repo, '.claude', 'state', 'eghs', 'schema_version'), '999\n');
+  const { stdout, code } = run(repo, { input: { session_id: SID } });
+  assert.equal(code, 0);
+  assert.match(JSON.parse(stdout).hookSpecificOutput.additionalContext, /eghs-migrate/);
 });
 
 test('EPIPE on stdout (reader gone) still exits 0 (fail-soft)', async () => {

@@ -206,10 +206,12 @@ test('R4 orphan scan claims a pre-file whose lease names a DEAD pid', () => {
     JSON.stringify({ schema_version: 1, pre_sha: null, pretool_sid: DEAD_SID })
   );
   // A freshly exited child's pid is provably dead (no reuse this fast).
+  // renewed_ms stays FRESH: a time-stale dead lease would be swept by the
+  // precedence #5b sessions GC before the R4 2nd-pass orphan scan ever ran.
   const deadPid = spawnSync('node', ['-e', '']).pid;
   fs.writeFileSync(
     path.join(repo, '.claude', 'state', 'eghs', 'sessions', `${DEAD_SID}.json`),
-    JSON.stringify({ pid: deadPid, uid: process.getuid(), start_ms: 1, renewed_ms: 1 })
+    JSON.stringify({ pid: deadPid, uid: process.getuid(), start_ms: 1, renewed_ms: Date.now() })
   );
   runHook(POST_HOOK, repo, editInput('PostToolUse', file));
   assert.ok(!fs.existsSync(orphan));
@@ -293,6 +295,120 @@ test('Write and MultiEdit run the same matrix as Edit', () => {
     readState(repo, file).sha,
     crypto.createHash('sha256').update('v3').digest('hex')
   );
+});
+
+// ---- P4 unit 10: R6 precedence rows (PostToolUse Write/Edit/MultiEdit) ----
+// R4 §510-513 NO_SESSION short-circuit + the #4 hook-type matrix row (§755):
+// every deny candidate degrades to a sid-scoped fail-closed marker + exit 0.
+
+function stateDirOf(repo) {
+  return path.join(repo, '.claude', 'state', 'eghs');
+}
+
+test('P4: NO_SESSION short-circuits exit 0 with one stderr line, no marker, no state', () => {
+  const repo = mkRepo();
+  const file = path.join(repo, 'ns.txt');
+  fs.writeFileSync(file, 'x');
+  const input = editInput('PostToolUse', file);
+  input.session_id = 'not-a-uuid';
+  const { exitCode, stdout, stderr } = runHook(POST_HOOK, repo, input);
+  assert.equal(exitCode, 0);
+  assert.equal(stdout, '');
+  assert.match(stderr, /NO_SESSION/);
+  assert.equal(readState(repo, file), null);
+  // R4 §512: no marker write, no pre/ lookup, no debug write.
+  assert.equal(fs.readdirSync(path.join(stateDirOf(repo), 'failed')).filter((n) => n !== 'tmp').length, 0);
+  assert.ok(!fs.existsSync(path.join(stateDirOf(repo), 'debug', 'not-a-uuid.jsonl')));
+});
+
+test('P4: live migrate.lock → sid-scoped migrate_in_progress marker, pre-file consumed, exit 0', () => {
+  const repo = mkRepo();
+  const file = path.join(repo, 'mig.txt');
+  fs.writeFileSync(file, 'v1');
+  runHook(PRE_HOOK, repo, editInput('PreToolUse', file));
+  assert.equal(preWriteFileCount(repo, SID), 1);
+  fs.writeFileSync(
+    path.join(stateDirOf(repo), 'migrate.lock'),
+    JSON.stringify({ pid: process.pid, uid: process.getuid(), start_ms: Date.now() })
+  );
+  fs.writeFileSync(file, 'v2');
+  const { exitCode, stdout } = runHook(POST_HOOK, repo, editInput('PostToolUse', file));
+  assert.equal(exitCode, 0);
+  assert.equal(stdout, '');
+  assert.equal(marker(repo, file, SID).reason, 'migrate_in_progress');
+  assert.equal(preWriteFileCount(repo, SID), 0);
+  assert.equal(readState(repo, file), null); // no evidence write behind a migrate
+});
+
+test('P4: corrupt migrate.lock (non-regular file) → marker migrate_lock_corrupt', () => {
+  const repo = mkRepo();
+  const file = path.join(repo, 'miglc.txt');
+  fs.writeFileSync(file, 'v1');
+  runHook(PRE_HOOK, repo, editInput('PreToolUse', file));
+  fs.mkdirSync(path.join(stateDirOf(repo), 'migrate.lock')); // directory, not a file
+  const { exitCode } = runHook(POST_HOOK, repo, editInput('PostToolUse', file));
+  assert.equal(exitCode, 0);
+  assert.equal(marker(repo, file, SID).reason, 'migrate_lock_corrupt');
+  assert.equal(preWriteFileCount(repo, SID), 0);
+});
+
+test('P4: sid tombstone → marker sid_cleared, pre-file consumed, exit 0', () => {
+  const repo = mkRepo();
+  const file = path.join(repo, 'tomb.txt');
+  fs.writeFileSync(file, 'v1');
+  runHook(PRE_HOOK, repo, editInput('PreToolUse', file));
+  fs.writeFileSync(
+    path.join(stateDirOf(repo), 'sessions', `${SID}.tombstone`),
+    JSON.stringify({ cleared_by_pid: 1, cleared_by_uid: process.getuid(), ts_ms: 1, reason: 'clear-sid' })
+  );
+  const { exitCode } = runHook(POST_HOOK, repo, editInput('PostToolUse', file));
+  assert.equal(exitCode, 0);
+  assert.equal(marker(repo, file, SID).reason, 'sid_cleared');
+  assert.equal(preWriteFileCount(repo, SID), 0);
+});
+
+test('P4: INVALID schema → marker schema_invalid (INVALID never fail-OPEN), exit 0', () => {
+  const repo = mkRepo();
+  const file = path.join(repo, 'inv.txt');
+  fs.writeFileSync(file, 'v1');
+  runHook(PRE_HOOK, repo, editInput('PreToolUse', file));
+  fs.writeFileSync(path.join(stateDirOf(repo), 'schema_version'), '01\n'); // strict-regex INVALID
+  const { exitCode } = runHook(POST_HOOK, repo, editInput('PostToolUse', file));
+  assert.equal(exitCode, 0);
+  assert.equal(marker(repo, file, SID).reason, 'schema_invalid');
+  assert.equal(preWriteFileCount(repo, SID), 0);
+  assert.equal(readState(repo, file), null);
+});
+
+test('P4: corrupt own lease → marker lease_unavailable (root cause preserved)', () => {
+  const repo = mkRepo();
+  const file = path.join(repo, 'cl.txt');
+  fs.writeFileSync(file, 'v1');
+  runHook(PRE_HOOK, repo, editInput('PreToolUse', file));
+  fs.writeFileSync(path.join(stateDirOf(repo), 'sessions', `${SID}.json`), '{ not json');
+  const { exitCode } = runHook(POST_HOOK, repo, editInput('PostToolUse', file));
+  assert.equal(exitCode, 0);
+  assert.equal(marker(repo, file, SID).reason, 'lease_unavailable');
+  assert.equal(preWriteFileCount(repo, SID), 0);
+});
+
+test('P4: SID_COLLISION (live foreign lease under our sid) → marker sid_collision', () => {
+  const repo = mkRepo();
+  const file = path.join(repo, 'coll.txt');
+  fs.writeFileSync(file, 'x');
+  // Live foreign lease (pid 1) + anchor-matching baseline → #6 branch-2
+  // collision. isAlive treats the EPERM from kill(1,0) as alive (fail-closed).
+  fs.writeFileSync(
+    path.join(stateDirOf(repo), 'sessions', `${SID}.json`),
+    JSON.stringify({ schema_version: 1, pid: 1, uid: process.getuid(), start_ms: 5, renewed_ms: Date.now() })
+  );
+  fs.writeFileSync(
+    path.join(stateDirOf(repo), 'baselines', `${SID}.txt`),
+    JSON.stringify({ commit: 'X', lease_start_ms: 5, lease_pid: 1 })
+  );
+  const { exitCode } = runHook(POST_HOOK, repo, editInput('PostToolUse', file));
+  assert.equal(exitCode, 0);
+  assert.equal(marker(repo, file, SID).reason, 'sid_collision');
 });
 
 test('tool_use_id keys the Pre→Post join: parallel calls on one file stay distinct (R16)', () => {

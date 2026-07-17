@@ -145,18 +145,72 @@ test('malformed stdin JSON is reported as INPUT_PARSE, not a crash', () => {
   assert.match(result.stderr, /INPUT_PARSE/);
 });
 
-test('missing/invalid session_id allows (NO_SESSION signal) without touching state', () => {
+test('P4: missing/invalid session_id fail-closed BLOCKS Stop (exit 2, NO_SESSION, G3)', () => {
+  const repo = mkRepo();
+  execFileSync('node', [INIT_SCRIPT], { cwd: repo });
+  writeConfig(repo, { verification_commands: { typecheck: 'true' } });
+  const { exitCode, stdout, stderr } = runStop(repo, { session_id: 'not-a-uuid' });
+  assert.equal(exitCode, 2);
+  assert.equal(stdout, '');
+  // PRD §691: verification did not run, so nothing may auto-pass. sid=none
+  // keeps the --clear-sid guidance honest (there is no sid to copy).
+  assert.match(stderr, /NO_SESSION/);
+  assert.match(stderr, /sid=none/);
+  const stateDir = path.join(repo, '.claude', 'state', 'eghs');
+  assert.ok(!fs.existsSync(path.join(stateDir, 'sessions', 'not-a-uuid.json')));
+});
+
+test('P4: live migrate.lock blocks Stop MASKED as INFRA_NOT_READY (original candidate in debug log only)', () => {
+  const repo = mkRepo();
+  execFileSync('node', [INIT_SCRIPT], { cwd: repo });
+  writeConfig(repo, { verification_commands: { typecheck: 'true' } });
+  const stateDir = path.join(repo, '.claude', 'state', 'eghs');
+  fs.writeFileSync(
+    path.join(stateDir, 'migrate.lock'),
+    JSON.stringify({ pid: process.pid, uid: process.getuid(), start_ms: Date.now() })
+  );
+  const { exitCode, stderr } = runStop(repo, { session_id: SID_1 });
+  assert.equal(exitCode, 2);
+  assert.match(stderr, /INFRA_NOT_READY/);
+  assert.ok(!/MIGRATE_IN_PROGRESS/.test(stderr), 'the raw candidate must not reach the model');
+  const debugLog = fs.readFileSync(path.join(stateDir, 'debug', `${SID_1}.jsonl`), 'utf8');
+  assert.match(debugLog, /MIGRATE_IN_PROGRESS/);
+});
+
+test('P4: CI env does NOT bypass Stop verification (G3, PRD §688)', () => {
   const repo = mkRepo();
   execFileSync('node', [INIT_SCRIPT], { cwd: repo });
   writeConfig(repo, { verification_commands: { lint: 'false' } });
-  const { exitCode, stdout, stderr } = runStop(repo, { session_id: 'not-a-uuid' });
-  assert.equal(exitCode, 0);
-  assert.equal(stdout, '');
-  // Fail-open path must be observable: docs only guarantee session_id is a
-  // string, so a format change would land here silently otherwise.
-  assert.match(stderr, /NO_SESSION/);
+  const { exitCode, stderr } = runStop(repo, { session_id: SID_1 }, { CI: 'true' });
+  assert.equal(exitCode, 2);
+  assert.match(stderr, /VERIFICATION_FAILED/);
+});
+
+test('P4: sid tombstone blocks Stop with INFRA_NOT_READY sid_cleared', () => {
+  const repo = mkRepo();
+  execFileSync('node', [INIT_SCRIPT], { cwd: repo });
+  writeConfig(repo, { verification_commands: { typecheck: 'true' } });
   const stateDir = path.join(repo, '.claude', 'state', 'eghs');
-  assert.ok(!fs.existsSync(path.join(stateDir, 'sessions', 'not-a-uuid.json')));
+  fs.writeFileSync(
+    path.join(stateDir, 'sessions', `${SID_1}.tombstone`),
+    JSON.stringify({ cleared_by_pid: 1, cleared_by_uid: process.getuid(), ts_ms: 1, reason: 'clear-sid' })
+  );
+  const { exitCode, stderr } = runStop(repo, { session_id: SID_1 });
+  assert.equal(exitCode, 2);
+  assert.match(stderr, /INFRA_NOT_READY/);
+  assert.match(stderr, /sid_cleared/);
+});
+
+test('P4: schema MISMATCH still runs verification (state-independent, PRD §826)', () => {
+  const repo = mkRepo();
+  execFileSync('node', [INIT_SCRIPT], { cwd: repo });
+  writeConfig(repo, { verification_commands: { lint: 'false' } });
+  const stateDir = path.join(repo, '.claude', 'state', 'eghs');
+  fs.writeFileSync(path.join(stateDir, 'schema_version'), '999\n'); // valid but not the hook version
+  const { exitCode, stderr } = runStop(repo, { session_id: SID_1 });
+  // The failing command proves verification actually executed on this row.
+  assert.equal(exitCode, 2);
+  assert.match(stderr, /VERIFICATION_FAILED/);
 });
 
 test('a second Stop run for the same sid reuses the same baseline (idempotent across renewal)', () => {

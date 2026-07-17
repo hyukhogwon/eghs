@@ -1,19 +1,14 @@
 #!/usr/bin/env node
 'use strict';
+const fs = require('fs');
 const { readStdin } = require('./lib/stdin');
-const { resolveStateDir } = require('./lib/state-dir');
-const { readSchemaVersion } = require('./lib/schema');
-const { checkKillSwitch } = require('./lib/kill-switch');
-const { isCI } = require('./lib/ci');
-const {
-  DISCIPLINE_PRINCIPLES,
-  INIT_GUIDANCE,
-  buildAdditionalContext,
-} = require('./lib/prompt-discipline');
+const { runPrecedence } = require('./lib/precedence');
+const { DISCIPLINE_PRINCIPLES, buildAdditionalContext } = require('./lib/prompt-discipline');
 
 // A dying host can close the stdout pipe before we write; the resulting EPIPE
 // arrives as an async 'error' event that no sync try/catch can intercept —
-// swallow it so the fail-soft exit-0 guarantee holds even then.
+// swallow it so the fail-soft exit-0 guarantee holds even then. (EPIPE
+// regression guard: DO NOT REMOVE.)
 process.stdout.on('error', () => {});
 
 // Emit additionalContext (or nothing) and exit 0. UserPromptSubmit is fail-soft:
@@ -25,39 +20,48 @@ function emitContext(text) {
 }
 
 function main() {
-  // Drain stdin so the writer never sees a broken pipe. P2 uses no input field,
-  // and the principles are input-independent, so parse failure is irrelevant.
+  // Best-effort parse: malformed stdin leaves input {}, which the chain's
+  // #3.5 classifies as the UPS NO_SESSION row (exit 0, no additionalContext
+  // per PRD §690) — parse failure must never block the prompt (R1).
+  let input = {};
   try {
-    readStdin();
+    const raw = readStdin();
+    input = raw ? JSON.parse(raw) : {};
   } catch {
-    // ignore — fall through to injection
+    // fall through with input = {}
   }
 
-  const repoRoot = process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  // Claude Code exports the project dir explicitly for UPS; honor it before
+  // cwd (P2 behavior preserved — cwd is wherever the host launched us).
+  const cwd = process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  const result = runPrecedence('ups', input, { env: process.env, cwd, nowMs: Date.now() });
 
-  // Kill switch: EGHS fully off -> inject nothing.
-  const killSwitch = checkKillSwitch({ repoRoot, env: process.env });
-  if (killSwitch.active) {
-    process.stderr.write(`[eghs] kill-switch active: ${killSwitch.reason}\n`);
+  if (result.outcome === 'continue') {
+    // #8: healthy state — inject the discipline principles.
+    try {
+      emitContext(DISCIPLINE_PRINCIPLES);
+    } finally {
+      if (typeof result.ctx.guardFd === 'number') fs.closeSync(result.ctx.guardFd);
+    }
+    return;
+  }
+
+  // R1 fail-soft: every non-continue outcome degrades to exit 0. The chain
+  // never returns deny/marker_exit0 for 'ups' (R6 #3.5/#4/#7 UPS rows are all
+  // exit0), and even if it ever did, exit 0 is the only prompt-safe answer.
+  if (result.outcome === 'exit0' && result.reason === 'kill_switch') {
+    process.stderr.write('[eghs] kill-switch active\n');
+  }
+  if (result.additionalContext) {
+    // R6 #4/#7 UPS rows (PRD §753/§824): stderr warning + the one-line notice
+    // as additionalContext; the discipline principles are skipped.
+    // additionalContext carries its own "eghs: " source tag for the model;
+    // strip it here so the stderr line is not double-prefixed.
+    process.stderr.write(`[eghs] ${result.additionalContext.replace(/^eghs: /, '')}\n`);
+    emitContext(result.additionalContext);
+  } else {
     emitContext(null);
-    return;
   }
-
-  // CI: no interactive model to nudge (PRD §6) -> inject nothing.
-  if (isCI(process.env)) {
-    emitContext(null);
-    return;
-  }
-
-  // Schema stat (fail-soft): not initialized / corrupt -> one-line init nudge.
-  const schema = readSchemaVersion(resolveStateDir(repoRoot));
-  if (schema.status !== 'ok') {
-    process.stderr.write(`[eghs] state ${schema.status}; injecting init guidance\n`);
-    emitContext(INIT_GUIDANCE);
-    return;
-  }
-
-  emitContext(DISCIPLINE_PRINCIPLES);
 }
 
 // Fail-soft backstop: a crash must never block the prompt (exit 0, not 1).
