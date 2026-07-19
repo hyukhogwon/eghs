@@ -6,7 +6,7 @@ const { resolveStateDir, STATE_SUBDIRS } = require('./state-dir');
 const { readSchemaVersion, HOOK_SCHEMA_VERSION } = require('./schema');
 const { checkKillSwitch } = require('./kill-switch');
 const { isCI } = require('./ci');
-const { readFsInfo } = require('./fs-info');
+const { readFsInfo, selfHealAnchorMismatch } = require('./fs-info');
 const { isValidSid } = require('./sid');
 const { getRepoRoot } = require('./git');
 const { acquireSidGuard } = require('./guard');
@@ -16,8 +16,9 @@ const { appendDebugLog } = require('./debug-log');
 const { loadConfig } = require('./config');
 const { establishLeaseAndBaseline } = require('./lease');
 
-// PRD §R6 precedence chain, stages #1-#3.7 (the mutation-free prefix; the
-// single sanctioned exception is #3.7's guard.lock create). Later stages
+// PRD §R6 precedence chain, stages #1-#3.7 (the mutation-free prefix; two
+// sanctioned exceptions: #3.7's guard.lock create and #3.3's anchor-mismatch
+// re-probe under .init.lock, 2026-07-19 amendment). Later stages
 // (#4 migrate.lock matrix, #5 GC, #6 lease, #7 classification) build on the
 // ctx this returns.
 //
@@ -56,8 +57,21 @@ function earlyPrecedence(hookKind, input, { env, cwd, nowMs }) {
   let fsInfo = { status: 'skipped' };
   if (diskSchema !== null) {
     fsInfo = readFsInfo(stateDir);
+    if (fsInfo.status === 'unhealthy' && fsInfo.reason === 'anchor_mismatch') {
+      // Anchor churn (APFS st_dev changes across reboots) ≠ broken infra:
+      // re-probe under .init.lock and continue on the FRESH values
+      // (mutation-free exception #2, 2026-07-19 amendment). Only the anchor
+      // equality failure self-heals — anchor_unverifiable stays fail-closed
+      // (the live anchor itself is unreadable, a re-probe proves nothing),
+      // and any heal failure degrades to the deny below.
+      const healed = selfHealAnchorMismatch(stateDir, nowMs);
+      if (healed) {
+        process.stderr.write('[eghs] fs-info anchor changed — re-probed\n');
+        fsInfo = { status: 'ok', caseless: healed.caseless };
+      }
+    }
     if (fsInfo.status === 'unhealthy') {
-      // Per-case stderr per PRD §R6 #3.3 (lines 681-683).
+      // Per-case stderr per PRD §R6 #3.3 (lines 681-685).
       if (fsInfo.reason === 'anchor_mismatch' || fsInfo.reason === 'anchor_unverifiable') {
         process.stderr.write('[eghs] fs-info.json FS anchor mismatch; run: eghs-init --repair to re-probe FS\n');
       } else if (fsInfo.reason === 'flock_not_ok') {

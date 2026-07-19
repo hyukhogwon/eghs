@@ -6,6 +6,7 @@ const os = require('os');
 const path = require('path');
 const { spawn, spawnSync, execFileSync } = require('child_process');
 const { earlyPrecedence } = require('../hooks/lib/precedence');
+const { liveAnchor } = require('../hooks/lib/fs-info');
 const { flockExNb } = require('../hooks/lib/flock');
 const { sleepMs } = require('../hooks/lib/stdin');
 
@@ -34,6 +35,29 @@ function run(kind, repo, opts = {}) {
 
 function closeGuard(r) {
   if (r.ctx && typeof r.ctx.guardFd === 'number') fs.closeSync(r.ctx.guardFd);
+}
+
+function captureStderr(fn) {
+  const orig = process.stderr.write;
+  let stderr = '';
+  process.stderr.write = (chunk) => {
+    stderr += chunk;
+    return true;
+  };
+  try {
+    return { result: fn(), stderr };
+  } finally {
+    process.stderr.write = orig;
+  }
+}
+
+// Simulate the APFS synthetic-st_dev churn (reboot changes st_dev) by
+// corrupting only the anchor of an otherwise healthy v2 body.
+function breakAnchor(repo) {
+  const p = path.join(stateDirOf(repo), 'fs-info.json');
+  const body = JSON.parse(fs.readFileSync(p, 'utf8'));
+  body.fs_st_dev = -1;
+  fs.writeFileSync(p, JSON.stringify(body));
 }
 
 test('#2 kill switch wins over everything, even corrupt fs-info (mutation-free exit 0)', () => {
@@ -179,6 +203,72 @@ test('#3.7 tombstone created between stat and lock is caught by the re-stat (sid
   );
   const r = run('pre-write', repo);
   assert.equal(r.reason, 'sid_cleared');
+});
+
+test('#3.3 anchor mismatch self-heals: re-probe under .init.lock, rewrite, continue (2026-07-19)', () => {
+  const repo = mkRepo();
+  breakAnchor(repo);
+  const { result: r, stderr } = captureStderr(() => run('pre-write', repo));
+  assert.equal(r.outcome, 'continue');
+  assert.equal(r.ctx.fsInfo.status, 'ok');
+  // fs-info.json rewritten with the live anchor + freshly probed caseless.
+  const body = JSON.parse(fs.readFileSync(path.join(stateDirOf(repo), 'fs-info.json'), 'utf8'));
+  const anchor = liveAnchor(stateDirOf(repo));
+  assert.equal(body.fs_st_dev, anchor.fsStDev);
+  assert.equal(body.fs_statfs_id, anchor.fsStatfsId);
+  assert.equal(body.flock_ok, true);
+  assert.equal(r.ctx.caseless, body.caseless_fs, 'ctx must carry the fresh probe value');
+  // Exactly one warn line, and the .init.lock was released.
+  const lines = stderr.split('\n').filter(Boolean);
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /fs-info anchor changed — re-probed/);
+  assert.ok(!fs.existsSync(path.join(stateDirOf(repo), '.init.lock')));
+  closeGuard(r);
+});
+
+test('#3.3 anchor mismatch + .init.lock held by a live process → fail-closed INFRA_NOT_READY', () => {
+  const repo = mkRepo();
+  breakAnchor(repo);
+  fs.writeFileSync(
+    path.join(stateDirOf(repo), '.init.lock'),
+    JSON.stringify({ pid: process.pid, uid: process.getuid(), start_ms: Date.now() })
+  );
+  const { result: r } = captureStderr(() => run('pre-write', repo));
+  assert.equal(r.outcome, 'candidate');
+  assert.equal(r.candidate, 'INFRA_NOT_READY');
+  assert.equal(r.reason, 'infra_not_ready');
+  // No self-heal ran: the stale anchor body is untouched, lock still there.
+  const body = JSON.parse(fs.readFileSync(path.join(stateDirOf(repo), 'fs-info.json'), 'utf8'));
+  assert.equal(body.fs_st_dev, -1);
+  assert.ok(fs.existsSync(path.join(stateDirOf(repo), '.init.lock')));
+});
+
+test('#3.3 anchor mismatch + probe failure → fail-closed, .init.lock never leaked', () => {
+  const repo = mkRepo();
+  breakAnchor(repo);
+  // Turn tmp/ into a regular file: the flock-probe mkdir throws mid-probe.
+  const tmp = path.join(stateDirOf(repo), 'tmp');
+  fs.rmSync(tmp, { recursive: true, force: true });
+  fs.writeFileSync(tmp, 'not a dir');
+  const { result: r } = captureStderr(() => run('pre-write', repo));
+  assert.equal(r.outcome, 'candidate');
+  assert.equal(r.candidate, 'INFRA_NOT_READY');
+  assert.equal(r.reason, 'infra_not_ready');
+  assert.ok(!fs.existsSync(path.join(stateDirOf(repo), '.init.lock')), 'failed heal must release the lock');
+});
+
+test('#3.3 non-anchor unhealthy reasons never re-probe (flock_not_ok stays fail-closed)', () => {
+  const repo = mkRepo();
+  const p = path.join(stateDirOf(repo), 'fs-info.json');
+  const body = JSON.parse(fs.readFileSync(p, 'utf8'));
+  body.flock_ok = false;
+  fs.writeFileSync(p, JSON.stringify(body));
+  const before = fs.readFileSync(p, 'utf8');
+  const { result: r } = captureStderr(() => run('pre-write', repo));
+  assert.equal(r.outcome, 'candidate');
+  assert.equal(r.candidate, 'INFRA_NOT_READY');
+  assert.equal(fs.readFileSync(p, 'utf8'), before, 'no rewrite for non-anchor unhealthy');
+  assert.ok(!fs.existsSync(path.join(stateDirOf(repo), '.init.lock')));
 });
 
 test('ctx carries stateDir, repoRoot, sid and caseless for downstream stages', () => {

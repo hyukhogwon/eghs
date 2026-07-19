@@ -183,4 +183,47 @@ function probeAndWriteFsInfo(stateDir, nowMs) {
   return caseless;
 }
 
-module.exports = { readFsInfo, probeAndWriteFsInfo, liveAnchor, FlockUnsupportedError };
+// Precedence #3.3 anchor-mismatch self-heal (PRD §R6 #3.3, 2026-07-19
+// amendment; mutation-free invariant exception #2). APFS synthetic st_dev
+// churns across reboots, so a stale anchor only means "the cached probe may
+// not describe the live volume" — re-probing restores exactly the guarantee
+// the anchor exists for. A hook holds no admin mutex, so it takes .init.lock
+// with the same single O_CREAT|O_EXCL create + JSON body eghs-init uses
+// (init's stale rules then cover a crashed heal) and NEVER inspects or
+// reclaims an existing lock: EEXIST — live admin op, concurrent heal, or a
+// stale lock awaiting admin reclaim — means fail-closed; the next hook call
+// simply retries. Returns {caseless} on success, null on any failure
+// (caller degrades to the INFRA_NOT_READY deny). Must never throw.
+function selfHealAnchorMismatch(stateDir, nowMs) {
+  const lockPath = path.join(stateDir, '.init.lock');
+  let fd;
+  try {
+    fd = fs.openSync(lockPath, 'wx', 0o600);
+  } catch {
+    return null; // busy (EEXIST) or uncreatable (EACCES/EROFS): fail-closed
+  }
+  try {
+    fs.writeSync(fd, JSON.stringify({ pid: process.pid, uid: process.getuid(), start_ms: nowMs }));
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = null;
+    return { caseless: probeAndWriteFsInfo(stateDir, nowMs) };
+  } catch {
+    return null; // probe/write failed (FlockUnsupported, RO dir, …): fail-closed
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // already closed / dead fd
+      }
+    }
+    try {
+      fs.unlinkSync(lockPath); // best-effort release; a leak is init-reclaimable
+    } catch {
+      // ENOENT race / RO dir — nothing more a hook may do
+    }
+  }
+}
+
+module.exports = { readFsInfo, probeAndWriteFsInfo, liveAnchor, selfHealAnchorMismatch, FlockUnsupportedError };

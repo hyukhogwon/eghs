@@ -381,7 +381,7 @@ State는 `.claude/state/eghs/` 아래 다음 구조로 저장한다.
           * macOS/BSD: `statfs.f_fstypename` (문자열, e.g. `"apfs"`, `"hfs"`). Linux integer와 구분 위해 문자열로 저장.
           * 값 저장 시 platform tag 접두어 사용: `"linux:0xef53"` 또는 `"darwin:apfs"`. 비교 시 tag+value 모두 일치해야 정상.
           * 다른 platform(FreeBSD/Solaris 등): `"posix:<uname 값>"`으로 fallback. 미지원 platform은 §3 Non-goal.
-       hook은 매 실행마다 fs-info.json 읽어 `flock_ok !== true` 시 `INFRA_NOT_READY reason=infra_not_ready`로 fail-closed 반환(stderr `run: eghs-init --repair to re-probe`). 또한 매 hook 시작 시 state root의 `st_dev` + platform-normalized statfs id 를 확인해 fs-info.json cache와 불일치 시 **동일하게 fail-closed**(FS 이동 감지). remediation은 `eghs-init --repair`. guard rwlock과 admin-mutex 정확성은 flock 지원에 종속되므로 미지원 FS는 지원 밖.
+       hook은 매 실행마다 fs-info.json 읽어 `flock_ok !== true` 시 `INFRA_NOT_READY reason=infra_not_ready`로 fail-closed 반환(stderr `run: eghs-init --repair to re-probe`). 또한 매 hook 시작 시 state root의 `st_dev` + platform-normalized statfs id 를 확인해 fs-info.json cache와 불일치 시 **`.init.lock` 하 자동 재 probe self-heal을 시도** — 성공 시 fs-info.json 재작성 + stderr 경고 1줄 후 fresh 값으로 계속 진행, lock 경합/probe 실패 시 fail-closed `INFRA_NOT_READY`(2026-07-19 개정, 상세는 §R6 #3.3; APFS synthetic st_dev 재부팅 churn 대응). remediation은 `eghs-init --repair`. guard rwlock과 admin-mutex 정확성은 flock 지원에 종속되므로 미지원 FS는 지원 밖.
     7. `schema_version`을 R2.5 atomic write로 작성(**strict 형식 `^[1-9][0-9]*\n$` 최대 32바이트**; 코드 버전 ≥ 1). `0\n`이나 선행 0(`01\n`) 금지 — precedence #1 reader와 동일 규칙. **반드시 5/6단계 완료 후에 schema_version을 마지막으로 작성**(schema 존재 = 모든 인프라 준비 완료의 단일 signal).
     8. probe 파일, `.init.lock`, `migrate.lock` 순서로 삭제. **admin-mutex 해제**.
 * `eghs-migrate` 동작 절차:
@@ -666,7 +666,7 @@ Auto-unblock 금지(R3 enum의 `Auto-unblock: No`):
 
 각 hook 진입 직후 다음 순서로 평가한다. 먼저 매칭되는 조건이 이긴다. **Hook 종류별 분기 포함**.
 
-**중요한 invariant**: precedence **#1~#3.7** (schema stat + kill switch + CI passthrough + flock capability 검증 + NO_SESSION validation + sid tombstone) 은 **state mutation 절대 금지**(stat/env/parse만). state mutation은 #4 이후에만 발생. kill switch/CI passthrough가 set이면 mutation 절차에 진입조차 안 한다. 이는 G5 ("즉시 비활성화 가능") + §R6 "kill switch 환경에서 disk leak 없음" 보장의 단일 근거. **순서**: schema stat(#1) → kill switch(#2, G5 최우선) → CI passthrough(#3) → flock 검증(#3.3) → NO_SESSION(#3.5) → sid tombstone(#3.7). kill switch는 fs-info 손상 시에도 반드시 우선 통과.
+**중요한 invariant**: precedence **#1~#3.7** (schema stat + kill switch + CI passthrough + flock capability 검증 + NO_SESSION validation + sid tombstone) 은 **state mutation 절대 금지**(stat/env/parse만). **허용 예외 2건**: ① #3.7 guard.lock create(아래 #3.7 참조), ② #3.3 anchor 불일치 시 `.init.lock` 하 fs-info 재 probe/재작성(2026-07-19 개정, 아래 #3.3 참조). 그 외 state mutation은 #4 이후에만 발생. kill switch/CI passthrough가 set이면 mutation 절차에 진입조차 안 한다. 이는 G5 ("즉시 비활성화 가능") + §R6 "kill switch 환경에서 disk leak 없음" 보장의 단일 근거. **순서**: schema stat(#1) → kill switch(#2, G5 최우선) → CI passthrough(#3) → flock 검증(#3.3) → NO_SESSION(#3.5) → sid tombstone(#3.7). kill switch는 fs-info 손상 시에도 반드시 우선 통과.
 
 1. **on-disk schema_version 읽기 (stat-only, mutation 없음)**: `.claude/state/eghs/schema_version`을 stat. mkdir/생성하지 않음.
     * 파일 부재 또는 state dir `ENOENT` → `disk_schema = null` (NOT_INITIALIZED 신호).
@@ -676,11 +676,13 @@ Auto-unblock 금지(R3 enum의 `Auto-unblock: No`):
     * `disk_schema == INVALID`는 NOT_INITIALIZED와 **명확히 구분**(아래 #7 분류 참조). INVALID은 fail-OPEN을 절대 허용하지 않는다.
 2. **Kill switch** (stat/env 검사만, mutation 없음): `.claude/eghs-off` regular file 또는 `EGHS_DISABLED=1`이면 즉시 exit 0. 모델 우회 risk는 §3 non-goal로 명시. stderr에 `[eghs] kill-switch active: <reason>` 1줄 로그 외 어떤 disk write도 없음. **G5 즉시 비활성화 보장**: kill switch는 fs-info.json corruption과 무관하게 반드시 통과되어야 하므로 #1.5 fs-info 검증보다 **앞선다**.
 3. **CI passthrough** (env 검사만, mutation 없음): Stop hook을 제외한 hook에서만 적용. `CI=true/1`, `GITHUB_ACTIONS=true`, `GITLAB_CI=true`, `BUILDKITE=true` 중 매칭 시 exit 0. Stop은 G3 보장을 위해 CI에서도 verification을 강제하므로 본 단계를 건너뛴다.
-3.3. **fs-info.json flock capability 검증 (stat + read only, mutation 없음)** — R2.5 eghs-init step 6 flock probe로 캐시된 값을 hook이 신뢰하기 전에 검증. kill switch(#2)/CI passthrough(#3) 통과 후에만 도달. **#1에서 결정된 `disk_schema`를 사용**: `disk_schema == null` 이면 부트스트랩 전이므로 본 단계 skip → 다음 단계 fall-through(#7에서 NOT_INITIALIZED 분기). `disk_schema != null` (INVALID 포함) 이면 다음을 수행:
+3.3. **fs-info.json flock capability 검증 (stat + read only; 단 anchor 불일치 self-heal 재 probe는 mutation-free invariant 예외 #2 — 2026-07-19 개정)** — R2.5 eghs-init step 6 flock probe로 캐시된 값을 hook이 신뢰하기 전에 검증. kill switch(#2)/CI passthrough(#3) 통과 후에만 도달. **#1에서 결정된 `disk_schema`를 사용**: `disk_schema == null` 이면 부트스트랩 전이므로 본 단계 skip → 다음 단계 fall-through(#7에서 NOT_INITIALIZED 분기). `disk_schema != null` (INVALID 포함) 이면 다음을 수행:
     * `fs-info.json` 부재 → `FS_INFO_MISSING` 후보 (#4/#7 분기에서 처리).
     * `fs-info.json` 파일 존재하지만 **regular file 아님/size > 4KB/JSON parse 실패/필수 필드(`schema_version`, `caseless_fs`, `flock_ok`, `fs_st_dev`, `fs_statfs_id`) 중 하나라도 누락 또는 type 불일치** → `INFRA_NOT_READY reason=infra_not_ready`, stderr `[eghs] fs-info.json corrupt; run: eghs-init --repair` 안내(legacy cache 및 partial-write 회복 경로 통합).
     * 읽기 성공하지만 `flock_ok !== true` → `INFRA_NOT_READY reason=infra_not_ready` 반환, stderr `run: eghs-init --repair`.
-    * `flock_ok === true` 이지만 현재 state root `st_dev` + platform-normalized FS type identifier가 cache의 `fs_st_dev`/`fs_statfs_id`와 불일치 → **FS 이동 감지**, `INFRA_NOT_READY reason=infra_not_ready` 반환, stderr `run: eghs-init --repair to re-probe FS`.
+    * `flock_ok === true` 이지만 현재 state root `st_dev` + platform-normalized FS type identifier가 cache의 `fs_st_dev`/`fs_statfs_id`와 불일치 → **FS 이동/anchor 변경 감지** — 즉시 fail-closed하지 않고 **`.init.lock` 하 자동 재 probe self-heal을 시도**한다(2026-07-19 개정; macOS APFS synthetic st_dev가 재부팅마다 변해 false-deny를 유발 — anchor의 목적은 "cache가 현재 volume의 probe 결과"임을 보장하는 것이므로 재 probe가 그 보장을 직접 복원):
+        * `.init.lock` 단일 non-blocking 생성(`O_CREAT|O_EXCL`, eghs-init step 4와 동일 JSON body) 성공 + probe 성공 → `fs-info.json` v2 재작성(새 anchor + 새로 probe한 `caseless_fs`/`flock_ok`), stderr 1줄 `[eghs] fs-info anchor changed — re-probed` 후 **fresh 값으로 hook 계속 진행**(deny 없음). hook은 admin-mutex를 보유하지 않으므로 기존 `.init.lock`의 stale 판정/reclaim은 절대 수행하지 않는다(create-only — 예외 #1 guard.lock create와 동일 원칙).
+        * `.init.lock` EEXIST(다른 admin op 또는 동시 self-heal 진행 중) 또는 probe 실패 → `INFRA_NOT_READY reason=infra_not_ready` 반환(기존 fail-closed 유지), stderr `run: eghs-init --repair to re-probe FS`. anchor 외 unhealthy 사유(corrupt/필드 누락/`flock_ok !== true` 등)는 본 self-heal 대상이 아니며 위 분기 그대로 fail-closed.
     * 모두 정상 → 다음 단계. **이 검증 없이 #3.7 flock에 의존하면 broken-NFS legacy cache에서 silent no-op flock 통과 → guard/tombstone 무력화**.
 
 3.5. **NO_SESSION strict validation (mutation 없음, #2 kill switch와 #3 CI passthrough 뒤에서만 도달)**: hook input JSON을 파싱해 `session_id` 필드를 strict UUIDv4 regex(R3 §)로 검증. 위반 또는 부재 시 hook 종류별 분기 — **`PreToolUse Write/Edit/MultiEdit` 및 `PreToolUse Read`는 fail-closed** (G1 Read-before-Edit는 sid 없이는 원천 검증 불가):
@@ -733,7 +735,7 @@ Auto-unblock 금지(R3 enum의 `Auto-unblock: No`):
 
     **flock 특성**: 프로세스 종료 시 커널 자동 해제 → dangling risk 없음. `flock(LOCK_NB)` fast path syscall ~1μs, §R5 hook budget(p95 100ms) 침해 없음.
 
-    본 단계는 mutation-free invariant에서 유일한 예외(guard.lock create): kill switch(#2)와 NO_SESSION(#3.5) 통과 후에만 create이 발생하므로 kill-switch/no-sid 환경에서 disk write 없음(G5 유지). CI passthrough(#3)는 Stop hook 제외 규칙(§CI passthrough)에 따라 CI 환경 Stop만 예외적으로 #3.7 진입 — 이 경우 guard.lock은 정상 sid lifecycle에 종속되어 §R6 #5b sessions cascade GC로 회수(cascade 목록에 guard.lock 포함).
+    본 단계는 mutation-free invariant의 예외 #1(guard.lock create; 예외 #2는 #3.3 anchor self-heal 재 probe — 2026-07-19 개정): kill switch(#2)와 NO_SESSION(#3.5) 통과 후에만 create이 발생하므로 kill-switch/no-sid 환경에서 disk write 없음(G5 유지). CI passthrough(#3)는 Stop hook 제외 규칙(§CI passthrough)에 따라 CI 환경 Stop만 예외적으로 #3.7 진입 — 이 경우 guard.lock은 정상 sid lifecycle에 종속되어 §R6 #5b sessions cascade GC로 회수(cascade 목록에 guard.lock 포함).
 4. **migrate.lock 체크 (state mutation 가능: stale lock 삭제)**: `.claude/state/eghs/migrate.lock` stat 후 다음 분기. 본 단계가 반환하는 모든 deny code는 **hook 종류별 재분류 매트릭스**(아래 표)를 통과한 결과를 반환한다.
     * 부재 → 다음 단계.
     * regular file이고 lock content 파싱 실패(open ENOENT race, JSON 깨짐 등) → 본 결정 보류, retry 1회 후 여전히 실패면 hook-type 매트릭스로 `INFRA_NOT_READY` 반환. **PostToolUse Write/Edit/MultiEdit의 marker `reason=migrate_lock_corrupt`로 표기**(원 root cause 보존; user에게 `--clear-migrate-lock` 안내).
