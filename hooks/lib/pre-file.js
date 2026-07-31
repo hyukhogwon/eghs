@@ -135,6 +135,7 @@ function gcPreFiles(stateDir, { nowMs }) {
 }
 
 module.exports = {
+  preFilePath,
   writePreFile,
   readPreFile,
   deletePreFile,

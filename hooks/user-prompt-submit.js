@@ -4,6 +4,8 @@ const fs = require('fs');
 const { readStdin } = require('./lib/stdin');
 const { runPrecedence } = require('./lib/precedence');
 const { DISCIPLINE_PRINCIPLES, buildAdditionalContext } = require('./lib/prompt-discipline');
+const { logDecision } = require('./lib/debug-log');
+const { runDryRunCli } = require('./lib/dry-run');
 
 // A dying host can close the stdout pipe before we write; the resulting EPIPE
 // arrives as an async 'error' event that no sync try/catch can intercept —
@@ -34,11 +36,15 @@ function main() {
   // Claude Code exports the project dir explicitly for UPS; honor it before
   // cwd (P2 behavior preserved — cwd is wherever the host launched us).
   const cwd = process.env.CLAUDE_PROJECT_DIR || process.cwd();
-  const result = runPrecedence('ups', input, { env: process.env, cwd, nowMs: Date.now() });
+  if (process.argv.includes('--dry-run')) return runDryRunCli('ups', input, { cwd });
+
+  const nowMs = Date.now();
+  const result = runPrecedence('ups', input, { env: process.env, cwd, nowMs });
 
   if (result.outcome === 'continue') {
     // #8: healthy state — inject the discipline principles.
     try {
+      logDecision(result.ctx.stateDir, result.ctx.sid, { tsMs: nowMs, hook: 'UserPromptSubmit', decision: 'allow' });
       emitContext(DISCIPLINE_PRINCIPLES);
     } finally {
       if (typeof result.ctx.guardFd === 'number') fs.closeSync(result.ctx.guardFd);

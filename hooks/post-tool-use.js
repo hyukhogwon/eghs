@@ -9,7 +9,8 @@ const { canonicalKey, canonicalKeyAllowMissing, keyHash, sha256File } = require(
 const { isAlive } = require('./lib/proc');
 const { writeReadState, writeFailedMarker, clearMarkersOnSuccess } = require('./lib/read-state');
 const { readPreFile, deletePreFile, normalizeToolUseId, listPreFilesForHash } = require('./lib/pre-file');
-const { appendDebugLog } = require('./lib/debug-log');
+const { logDecision } = require('./lib/debug-log');
+const { runDryRunCli } = require('./lib/dry-run');
 const { resolveStateDir } = require('./lib/state-dir');
 const { readFsInfo } = require('./lib/fs-info');
 const { getRepoRoot } = require('./lib/git');
@@ -21,13 +22,32 @@ process.stdout.on('error', () => {});
 
 const TOOL_KINDS = { Read: 'post-read', Write: 'post-write', Edit: 'post-write', MultiEdit: 'post-write' };
 
-function skipLog(ctx, input, nowMs, denyCode) {
-  appendDebugLog(ctx.stateDir, ctx.sid, {
-    ts_ms: nowMs,
+function skipLog(ctx, input, nowMs, denyCode, key = null) {
+  logDecision(ctx.stateDir, ctx.sid, {
+    tsMs: nowMs,
     hook: 'PostToolUse',
     tool: input.tool_name,
+    path: key,
     decision: 'skip',
-    deny_code: denyCode,
+    denyCode,
+  });
+}
+
+// PRD §5: `has_gate_passing_state` is the R3-gate-passing evidence set.
+const GATE_EVIDENCE = new Set(['full_read', 'post_edit_success']);
+
+function recordLog(ctx, input, nowMs, { key, evidence, denyCode = null, decision }) {
+  logDecision(ctx.stateDir, ctx.sid, {
+    tsMs: nowMs,
+    hook: 'PostToolUse',
+    tool: input.tool_name,
+    path: key,
+    // The tool call already ran; a landed record is this hook's "allow", and
+    // a row that records nothing (no-op edit, clean failure) is a "skip".
+    decision: decision || (evidence ? 'allow' : 'skip'),
+    denyCode,
+    evidenceKind: evidence || null,
+    hasGatePassingState: GATE_EVIDENCE.has(evidence),
   });
 }
 
@@ -42,7 +62,7 @@ function handleRead(ctx, input, config, lease, nowMs) {
   }
   const key = resolved.key;
   if (isOutsideRepo(key, ctx.repoRoot, ctx.caseless)) {
-    skipLog(ctx, input, nowMs, null);
+    skipLog(ctx, input, nowMs, null, key);
     return;
   }
 
@@ -50,7 +70,7 @@ function handleRead(ctx, input, config, lease, nowMs) {
   try {
     size = fs.statSync(key).size;
   } catch {
-    skipLog(ctx, input, nowMs, 'FILE_UNREADABLE');
+    skipLog(ctx, input, nowMs, 'FILE_UNREADABLE', key);
     return;
   }
 
@@ -64,7 +84,7 @@ function handleRead(ctx, input, config, lease, nowMs) {
       evidence: 'partial_read',
     });
     deletePreFile(ctx.stateDir, ctx.sid, key, toolUseId, 'read');
-    appendDebugLog(ctx.stateDir, ctx.sid, { ts_ms: nowMs, hook: 'PostToolUse', tool: 'Read', decision: 'record', deny_code: null, evidence: 'partial_read' });
+    recordLog(ctx, input, nowMs, { key, evidence: 'partial_read' });
   }
 
   // partial_read (PRD §R2): explicit offset/limit, or a file too large for
@@ -79,7 +99,7 @@ function handleRead(ctx, input, config, lease, nowMs) {
 
   const hashed = sha256File(key);
   if (!hashed.ok) {
-    skipLog(ctx, input, nowMs, 'FILE_UNREADABLE');
+    skipLog(ctx, input, nowMs, 'FILE_UNREADABLE', key);
     return;
   }
   // Re-check with the hash's own byte count: a file that grew past the cap
@@ -115,13 +135,11 @@ function handleRead(ctx, input, config, lease, nowMs) {
   }
 
   deletePreFile(ctx.stateDir, ctx.sid, key, toolUseId, 'read');
-  appendDebugLog(ctx.stateDir, ctx.sid, {
-    ts_ms: nowMs,
-    hook: 'PostToolUse',
-    tool: 'Read',
-    decision: wrote.ok ? 'record' : 'skip',
-    deny_code: wrote.ok ? null : 'STATE_RECORD_FAILED',
+  recordLog(ctx, input, nowMs, {
+    key,
     evidence,
+    decision: wrote.ok ? undefined : 'skip',
+    denyCode: wrote.ok ? null : 'STATE_RECORD_FAILED',
   });
 }
 
@@ -209,7 +227,7 @@ function handleWrite(ctx, input, lease, nowMs) {
   }
   const key = resolved.key;
   if (isOutsideRepo(key, ctx.repoRoot, ctx.caseless)) {
-    skipLog(ctx, input, nowMs, null);
+    skipLog(ctx, input, nowMs, null, key);
     return;
   }
 
@@ -218,7 +236,7 @@ function handleWrite(ctx, input, lease, nowMs) {
   // swallow a real disk change, so it skips instead.
   const post = sha256File(key);
   if (!post.ok && !post.missing) {
-    skipLog(ctx, input, nowMs, 'FILE_UNREADABLE');
+    skipLog(ctx, input, nowMs, 'FILE_UNREADABLE', key);
     return;
   }
   const postSha = post.ok ? post.sha : null;
@@ -230,12 +248,12 @@ function handleWrite(ctx, input, lease, nowMs) {
     // pre-file must survive as the only remaining trace of the poisoning.
     writeFailedMarker(ctx.stateDir, key, { sid: ctx.sid, tsMs: nowMs, reason: 'state_record_failed', sidScoped: true });
     deletePreFile(ctx.stateDir, ctx.sid, key, toolUseId, 'write');
-    skipLog(ctx, input, nowMs, 'STATE_RECORD_FAILED');
+    skipLog(ctx, input, nowMs, 'STATE_RECORD_FAILED', key);
     return;
   }
   if (pre === null) {
     handleMissingPre(ctx, key, nowMs);
-    skipLog(ctx, input, nowMs, 'STATE_RECORD_FAILED');
+    skipLog(ctx, input, nowMs, 'STATE_RECORD_FAILED', key);
     return;
   }
   const preSha = typeof pre.pre_sha === 'string' ? pre.pre_sha : null;
@@ -286,15 +304,12 @@ function handleWrite(ctx, input, lease, nowMs) {
   if (warn) process.stderr.write(`[eghs] post-tool-use: ${warn}: ${key}\n`);
 
   deletePreFile(ctx.stateDir, ctx.sid, key, toolUseId, 'write'); // PRD R4: consumed last
-  appendDebugLog(ctx.stateDir, ctx.sid, {
-    ts_ms: nowMs,
-    hook: 'PostToolUse',
-    tool: input.tool_name,
-    decision: evidence || markerReason ? 'record' : 'skip',
+  recordLog(ctx, input, nowMs, {
+    key,
+    evidence,
     // STATE_RECORD_FAILED only when no evidence landed — matrix rows that
     // record post_edit_partial alongside their marker are not record failures.
-    deny_code: recordFailed || markerReason === 'state_record_failed' ? 'STATE_RECORD_FAILED' : null,
-    evidence,
+    denyCode: recordFailed || markerReason === 'state_record_failed' ? 'STATE_RECORD_FAILED' : null,
   });
 }
 
@@ -321,17 +336,20 @@ function writeFailClosedMarker(input, markerReason, nowMs) {
 }
 
 function main() {
+  const dryRun = process.argv.includes('--dry-run');
   let input;
   try {
     const raw = readStdin();
     input = raw ? JSON.parse(raw) : {};
   } catch (err) {
+    if (dryRun) return runDryRunCli(null, {}, { skipReason: 'input_parse' });
     process.stderr.write(`[eghs] post-tool-use: stdin parse failed (skip): ${err.message}\n`);
     return;
   }
 
   const hookKind = TOOL_KINDS[input.tool_name];
   const filePath = input.tool_input && input.tool_input.file_path;
+  if (dryRun) return runDryRunCli(hookKind && typeof filePath === 'string' ? hookKind : null, input);
   if (!hookKind || typeof filePath !== 'string') return; // not our tool: skip
 
   const nowMs = Date.now();

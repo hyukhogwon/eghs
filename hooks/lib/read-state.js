@@ -90,4 +90,4 @@ function clearMarkersOnSuccess(stateDir, key, { sid, leaseStartMs }) {
   }
 }
 
-module.exports = { writeReadState, readReadState, writeFailedMarker, clearMarkersOnSuccess };
+module.exports = { readsPath, writeReadState, readReadState, writeFailedMarker, clearMarkersOnSuccess };

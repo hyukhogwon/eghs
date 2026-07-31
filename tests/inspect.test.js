@@ -127,3 +127,19 @@ test('--dry-run with malformed stdin exits 1', () => {
   assert.equal(exitCode, 1);
   assert.match(stderr, /JSON/i);
 });
+
+test('--dry-run carries the normative hook decision (PRD §858 shape) and writes nothing', () => {
+  const repo = mkRepo();
+  fs.writeFileSync(path.join(repo, '.claude', 'eghs.config.json'), JSON.stringify({ state_gate_paths: ['*.txt'] }));
+  const file = path.join(repo, 'gated.txt');
+  fs.writeFileSync(file, 'unread');
+
+  const { exitCode, stdout } = run(repo, ['--dry-run'], JSON.stringify(hookInput('PreToolUse', 'Edit', file)));
+
+  assert.equal(exitCode, 0); // inspect itself always exits 0/1, never 2
+  const out = JSON.parse(stdout);
+  assert.equal(out.decision.decision, 'block');
+  assert.equal(out.decision.deny_code, 'UNREAD_OR_STALE');
+  assert.ok(Array.isArray(out.decision.would_write));
+  assert.ok(!fs.existsSync(path.join(repo, '.claude', 'state', 'eghs', 'debug', `${SID}.jsonl`)));
+});

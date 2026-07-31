@@ -12,7 +12,7 @@ const { getRepoRoot } = require('./git');
 const { acquireSidGuard } = require('./guard');
 const { gcSessions, sweepOrphanTombstones } = require('./session');
 const { gcPreFiles } = require('./pre-file');
-const { appendDebugLog } = require('./debug-log');
+const { appendDebugLog, setDebugEnabled } = require('./debug-log');
 const { loadConfig } = require('./config');
 const { establishLeaseAndBaseline } = require('./lease');
 
@@ -33,7 +33,11 @@ const { establishLeaseAndBaseline } = require('./lease');
 
 const HOOK_KINDS = new Set(['pre-write', 'pre-read', 'post-write', 'post-read', 'ups', 'stop']);
 
-function earlyPrecedence(hookKind, input, { env, cwd, nowMs }) {
+// `dryRun` (PRD §R6 dry-run 모드, lines 853-859): #1-#3.5 run verbatim (they
+// are mutation-free anyway); #3.7 keeps the tombstone stat but suppresses the
+// guard.lock create+flock, recording the path in `wouldWrite` and continuing
+// as if it had succeeded.
+function earlyPrecedence(hookKind, input, { env, cwd, nowMs, dryRun = false, wouldWrite = [] }) {
   if (!HOOK_KINDS.has(hookKind)) throw new Error(`unknown hook kind: ${hookKind}`);
   const repoRoot = getRepoRoot(cwd) || cwd;
   const stateDir = resolveStateDir(repoRoot);
@@ -103,19 +107,28 @@ function earlyPrecedence(hookKind, input, { env, cwd, nowMs }) {
   // ENOENT-crash on the missing sessions/ dir.
   let guardFd = null;
   if (diskSchema !== null) {
-    const guard = acquireSidGuard(stateDir, sid);
-    if (guard.outcome === 'sid_cleared') {
-      return { outcome: 'candidate', candidate: 'INFRA_NOT_READY', reason: 'sid_cleared' };
-    }
-    if (guard.outcome === 'infra') {
-      // Repair guidance only for ENOENT (sessions/ hand-deleted, PRD §706);
-      // EACCES and the rest return silently per spec.
-      if (guard.detail && guard.detail.includes('ENOENT')) {
-        process.stderr.write('[eghs] sessions/ missing; run: eghs-init --repair\n');
+    if (dryRun) {
+      // Tombstone stat is not a mutation, so it decides for real; the guard
+      // create/flock is suppressed and assumed to succeed (PRD §855).
+      if (fs.existsSync(path.join(stateDir, 'sessions', `${sid}.tombstone`))) {
+        return { outcome: 'candidate', candidate: 'INFRA_NOT_READY', reason: 'sid_cleared' };
       }
-      return { outcome: 'candidate', candidate: 'INFRA_NOT_READY', reason: 'infra_not_ready' };
+      wouldWrite.push(path.join(stateDir, 'sessions', `${sid}.guard.lock`));
+    } else {
+      const guard = acquireSidGuard(stateDir, sid);
+      if (guard.outcome === 'sid_cleared') {
+        return { outcome: 'candidate', candidate: 'INFRA_NOT_READY', reason: 'sid_cleared' };
+      }
+      if (guard.outcome === 'infra') {
+        // Repair guidance only for ENOENT (sessions/ hand-deleted, PRD §706);
+        // EACCES and the rest return silently per spec.
+        if (guard.detail && guard.detail.includes('ENOENT')) {
+          process.stderr.write('[eghs] sessions/ missing; run: eghs-init --repair\n');
+        }
+        return { outcome: 'candidate', candidate: 'INFRA_NOT_READY', reason: 'infra_not_ready' };
+      }
+      guardFd = guard.guardFd;
     }
-    guardFd = guard.guardFd;
   }
 
   return {
@@ -130,6 +143,8 @@ function earlyPrecedence(hookKind, input, { env, cwd, nowMs }) {
       fsInfo,
       caseless: fsInfo.status === 'ok' ? fsInfo.caseless : null,
       guardFd,
+      dryRun,
+      wouldWrite,
     },
   };
 }
@@ -152,7 +167,7 @@ function readMigrateLockBody(lockPath) {
   }
 }
 
-function checkMigrateLock(stateDir, { uid, nowMs }) {
+function checkMigrateLock(stateDir, { uid, nowMs, dryRun = false, wouldWrite = [] }) {
   const lockPath = path.join(stateDir, 'migrate.lock');
   let st;
   try {
@@ -192,6 +207,10 @@ function checkMigrateLock(stateDir, { uid, nowMs }) {
   }
   if (nowMs - body.start_ms < MIGRATE_LOCK_GRACE_MS) {
     return { candidate: 'MIGRATE_IN_PROGRESS' }; // fresh crash: protect the grace window
+  }
+  if (dryRun) {
+    wouldWrite.push(lockPath); // stale unlink suppressed, assumed to succeed
+    return null;
   }
   try {
     fs.unlinkSync(lockPath); // stale: same uid + dead + grace elapsed
@@ -295,7 +314,10 @@ function gcPass(ctx, config) {
   const { stateDir, diskSchema, nowMs } = ctx;
   const uid = process.getuid();
 
-  if (diskSchema !== null) {
+  // Dry-run: every #5 GC target is a mutation (PRD §855 suppresses them all).
+  // The GC libs plan and delete in one pass, so a dry-run cannot enumerate
+  // what they would have removed — would_write stays silent for #5.
+  if (diskSchema !== null && !ctx.dryRun) {
     gcRecoverLocks(stateDir, { uid, nowMs });
     gcSessions(stateDir, {
       nowMs,
@@ -348,6 +370,27 @@ function establishLease(ctx) {
 
   // #6.3/#6.4: lease only when schema matches the hook version and fs-info ok.
   if (diskSchemaNow !== HOOK_SCHEMA_VERSION || fsInfo.status !== 'ok') return { skip: true };
+
+  if (ctx.dryRun) {
+    // #6 lease/baseline writes suppressed; the decision continues as if they
+    // had succeeded (PRD §856). An existing readable lease supplies the real
+    // start_ms (the R3 marker-release policy reads it); otherwise a fresh
+    // lease body is synthesized. Deviation: the §6.3b stale-cleanup and
+    // SID_COLLISION branches are mutation-bound and therefore not simulated.
+    ctx.wouldWrite.push(path.join(stateDir, 'sessions', `${sid}.json`));
+    ctx.wouldWrite.push(path.join(stateDir, 'baselines', `${sid}.txt`));
+    let existing = null;
+    try {
+      const body = JSON.parse(fs.readFileSync(path.join(stateDir, 'sessions', `${sid}.json`), 'utf8'));
+      if (body !== null && typeof body === 'object' && typeof body.start_ms === 'number') existing = body;
+    } catch {
+      // absent or corrupt: fall through to the synthesized body
+    }
+    return {
+      ok: true,
+      lease: existing || { schema_version: 1, pid: process.ppid, uid: process.getuid(), start_ms: nowMs, renewed_ms: nowMs },
+    };
+  }
 
   const result = establishLeaseAndBaseline(stateDir, sid, {
     pid: process.ppid,
@@ -446,13 +489,21 @@ function schemaActionToOutcome(action, ctx) {
 //   {outcome:'exit0', reason, additionalContext?}
 //   {outcome:'marker_exit0', markerReason}    — PostToolUse fail-closed marker
 //   {outcome:'deny', denyCode, autoUnblock?, reason?, maskedFrom?}
-function runPrecedence(hookKind, input, { env, cwd, nowMs }) {
-  const early = earlyPrecedence(hookKind, input, { env, cwd, nowMs });
-  if (early.outcome === 'exit0') return early;
-  if (early.outcome === 'deny') return early; // NO_SESSION (final)
+function runPrecedence(hookKind, input, { env, cwd, nowMs, dryRun = false }) {
+  // A debug-log line is a state write: dry-run suppresses it like every other
+  // mutation (config-driven disable lands below, once config is readable).
+  // Set on BOTH paths so a dry-run never leaves logging off for a later
+  // in-process run (inspect.js and the tests both call this more than once).
+  setDebugEnabled(!dryRun);
+  const wouldWrite = [];
+  const withWrites = (result) => ({ ...result, wouldWrite });
+
+  const early = earlyPrecedence(hookKind, input, { env, cwd, nowMs, dryRun, wouldWrite });
+  if (early.outcome === 'exit0') return withWrites(early);
+  if (early.outcome === 'deny') return withWrites(early); // NO_SESSION (final)
   if (early.outcome === 'candidate') {
     if (early.ctx && typeof early.ctx.guardFd === 'number') fs.closeSync(early.ctx.guardFd);
-    return candidateToOutcome(hookKind, early);
+    return withWrites(candidateToOutcome(hookKind, early));
   }
 
   const ctx = early.ctx;
@@ -463,9 +514,12 @@ function runPrecedence(hookKind, input, { env, cwd, nowMs }) {
     // A malformed eghs.config.json is an infra fault, not a bypass.
     process.stderr.write(`[eghs] ${err.message}\n`);
     if (typeof ctx.guardFd === 'number') fs.closeSync(ctx.guardFd);
-    return candidateToOutcome(hookKind, { candidate: 'INFRA_NOT_READY', reason: 'infra_not_ready' });
+    return withWrites(candidateToOutcome(hookKind, { candidate: 'INFRA_NOT_READY', reason: 'infra_not_ready' }));
   }
   ctx.config = config;
+  // PRD §5: the measurement log is default-ON; `debug: false` is the only off
+  // switch (dry-run already disabled it above and must stay disabled).
+  if (!dryRun) setDebugEnabled(config.debug !== false);
 
   const settle = (result) => {
     // A non-continue result means this hook is done — release the guard now.
@@ -473,11 +527,11 @@ function runPrecedence(hookKind, input, { env, cwd, nowMs }) {
       fs.closeSync(ctx.guardFd);
       ctx.guardFd = null;
     }
-    return result;
+    return withWrites(result);
   };
 
   // #4 migrate.lock.
-  const mig = checkMigrateLock(ctx.stateDir, { uid: process.getuid(), nowMs });
+  const mig = checkMigrateLock(ctx.stateDir, { uid: process.getuid(), nowMs, dryRun, wouldWrite });
   if (mig) return settle(candidateToOutcome(hookKind, mig));
 
   // #5 GC + subdir validation.
@@ -491,7 +545,7 @@ function runPrecedence(hookKind, input, { env, cwd, nowMs }) {
 
   // #7 schema/fs-info classification.
   const state = classifySchemaState(ctx);
-  if (state === 'OK') return { outcome: 'continue', ctx }; // → #8 hook logic
+  if (state === 'OK') return withWrites({ outcome: 'continue', ctx }); // → #8 hook logic
   return settle(schemaActionToOutcome(classifySchemaForHook(hookKind, state), ctx));
 }
 

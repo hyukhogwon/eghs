@@ -8,7 +8,8 @@ const { resolveStateDir } = require('./lib/state-dir');
 const { getRepoRoot } = require('./lib/git');
 const { acquireStopLock } = require('./lib/lock');
 const { runVerification } = require('./lib/verify');
-const { appendDebugLog } = require('./lib/debug-log');
+const { logDecision } = require('./lib/debug-log');
+const { runDryRunCli } = require('./lib/dry-run');
 const { formatBlock } = require('./lib/deny');
 
 function emit(exitCode, decision, extra) {
@@ -93,11 +94,11 @@ async function runStopLogic(ctx, nowMs) {
     }
 
     if (verifyError) {
-      appendDebugLog(stateDir, sid, {
-        ts_ms: nowMs,
+      logDecision(stateDir, sid, {
+        tsMs: nowMs,
         hook: 'Stop',
         decision: 'block',
-        deny_code: 'INFRA_NOT_READY',
+        denyCode: 'INFRA_NOT_READY',
       });
       outcome = {
         exitCode: 2,
@@ -105,11 +106,11 @@ async function runStopLogic(ctx, nowMs) {
         extra: {},
       };
     } else {
-      appendDebugLog(stateDir, sid, {
-        ts_ms: nowMs,
+      logDecision(stateDir, sid, {
+        tsMs: nowMs,
         hook: 'Stop',
         decision: result.passed ? 'allow' : 'block',
-        deny_code: result.passed ? null : 'VERIFICATION_FAILED',
+        denyCode: result.passed ? null : 'VERIFICATION_FAILED',
       });
 
       outcome = result.passed
@@ -137,8 +138,11 @@ async function runStopLogic(ctx, nowMs) {
 }
 
 async function main() {
+  const dryRun = process.argv.includes('--dry-run');
+
   // Recursion guard — checked before anything else touches disk (PRD §R5).
   if (process.env.STOP_HOOK_ACTIVE === '1') {
+    if (dryRun) return runDryRunCli(null, {}, { skipReason: 'recursion_guard' });
     emit(0, { decision: 'allow', reason: 'recursion guard (env)' });
     return;
   }
@@ -148,14 +152,20 @@ async function main() {
     const raw = readStdin();
     input = raw ? JSON.parse(raw) : {};
   } catch {
+    if (dryRun) return runDryRunCli(null, {}, { skipReason: 'input_parse' });
     emit(2, { decision: 'block', deny_code: 'INPUT_PARSE', reason: 'malformed stdin JSON' });
     return;
   }
 
   if (input.stop_hook_active === true) {
+    if (dryRun) return runDryRunCli(null, input, { skipReason: 'recursion_guard' });
     emit(0, { decision: 'allow', reason: 'recursion guard (input field)' });
     return;
   }
+
+  // Dry-run stops here: the chain runs mutation-free and #8 verification is
+  // NOT executed (it would spawn typecheck/lint and write verify-logs).
+  if (dryRun) return runDryRunCli('stop', input);
 
   // PRD §R6 precedence chain #1-#7. Stop is fail-closed: every deny is a real
   // exit 2 block, and CI passthrough does NOT apply (G3, PRD §688) — the
@@ -177,11 +187,11 @@ async function main() {
     const sid = result.denyCode === 'NO_SESSION' ? null : input.session_id;
     if (typeof sid === 'string') {
       const stateDir = resolveStateDir(getRepoRoot(process.cwd()) || process.cwd());
-      appendDebugLog(stateDir, sid, {
-        ts_ms: nowMs,
+      logDecision(stateDir, sid, {
+        tsMs: nowMs,
         hook: 'Stop',
         decision: 'block',
-        deny_code: result.denyCode,
+        denyCode: result.denyCode,
         ...(result.maskedFrom ? { masked_from: result.maskedFrom } : {}),
       });
     }

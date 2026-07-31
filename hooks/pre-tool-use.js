@@ -6,7 +6,8 @@ const { runPrecedence } = require('./lib/precedence');
 const { evaluateGate } = require('./lib/gate');
 const { canonicalKey, sha256File } = require('./lib/canonical');
 const { writePreFile, deletePreFile, normalizeToolUseId } = require('./lib/pre-file');
-const { appendDebugLog } = require('./lib/debug-log');
+const { logDecision } = require('./lib/debug-log');
+const { runDryRunCli } = require('./lib/dry-run');
 const { formatBlock } = require('./lib/deny');
 
 // P4 PreToolUse GATES Write/Edit/MultiEdit (PRD §R3): a deny is exit 2, which
@@ -26,20 +27,21 @@ function block(denyCode, { reason, sid }) {
 function recordRead(ctx, input, nowMs, toolUseId) {
   const resolved = canonicalKey(input.tool_input.file_path, { caseless: ctx.caseless });
   if (!resolved.ok) {
-    appendDebugLog(ctx.stateDir, ctx.sid, { ts_ms: nowMs, hook: 'PreToolUse', tool: input.tool_name, decision: 'skip', deny_code: 'FILE_UNREADABLE' });
+    logPre(ctx, input, nowMs, { decision: 'skip', denyCode: 'FILE_UNREADABLE' });
     return;
   }
   const hashed = sha256File(resolved.key);
   if (!hashed.ok) {
-    appendDebugLog(ctx.stateDir, ctx.sid, { ts_ms: nowMs, hook: 'PreToolUse', tool: input.tool_name, decision: 'skip', deny_code: 'FILE_UNREADABLE' });
+    logPre(ctx, input, nowMs, { decision: 'skip', denyCode: 'FILE_UNREADABLE', path: resolved.key });
     return;
   }
   writePreFile(ctx.stateDir, ctx.sid, resolved.key, toolUseId, 'read', { sha: hashed.sha, ts_ms: nowMs, pretool_sid: ctx.sid });
-  appendDebugLog(ctx.stateDir, ctx.sid, { ts_ms: nowMs, hook: 'PreToolUse', tool: input.tool_name, decision: 'record', deny_code: null });
+  // Read is never gated: recording its pre-SHA is an allow (PRD §5 enum).
+  logPre(ctx, input, nowMs, { decision: 'allow', path: resolved.key });
 }
 
 function logPre(ctx, input, nowMs, fields) {
-  appendDebugLog(ctx.stateDir, ctx.sid, { ts_ms: nowMs, hook: 'PreToolUse', tool: input.tool_name, ...fields });
+  logDecision(ctx.stateDir, ctx.sid, { tsMs: nowMs, hook: 'PreToolUse', tool: input.tool_name, ...fields });
 }
 
 // PreToolUse Write/Edit/MultiEdit: the R3 gate. Returns a deny descriptor
@@ -49,14 +51,20 @@ function handleWriteGate(ctx, input, nowMs, toolUseId) {
   const gate = evaluateGate(ctx, input.tool_input.file_path, { nowMs });
 
   if (gate.skip === 'outside_repo') {
-    logPre(ctx, input, nowMs, { decision: 'skip', deny_code: null, gate_applicable: false });
+    logPre(ctx, input, nowMs, { decision: 'skip', path: gate.key });
     return null; // out of EGHS scope: allow, record nothing
   }
 
   if (gate.allow) {
     // Matched-and-passed (preSha=state.sha) OR new-file Write (preSha=null).
     writePreFile(ctx.stateDir, ctx.sid, gate.key, toolUseId, 'write', { pre_sha: gate.preSha, ts_ms: nowMs, pretool_sid: ctx.sid });
-    logPre(ctx, input, nowMs, { decision: 'allow', deny_code: null, gate_applicable: true, has_gate_passing_state: gate.preSha !== null });
+    logPre(ctx, input, nowMs, {
+      decision: 'allow',
+      path: gate.key,
+      gateApplicable: true,
+      hasGatePassingState: gate.preSha !== null,
+      evidenceKind: gate.evidence || null, // null on the new-file Write row
+    });
     return null;
   }
 
@@ -67,24 +75,25 @@ function handleWriteGate(ctx, input, nowMs, toolUseId) {
     if (!gate.missing) {
       const hashed = sha256File(gate.key);
       if (!hashed.ok) {
-        logPre(ctx, input, nowMs, { decision: 'skip', deny_code: 'FILE_UNREADABLE', gate_applicable: false });
+        logPre(ctx, input, nowMs, { decision: 'skip', denyCode: 'FILE_UNREADABLE', path: gate.key });
         return null;
       }
       preSha = hashed.sha;
     }
     writePreFile(ctx.stateDir, ctx.sid, gate.key, toolUseId, 'write', { pre_sha: preSha, ts_ms: nowMs, pretool_sid: ctx.sid });
-    logPre(ctx, input, nowMs, { decision: 'record', deny_code: null, gate_applicable: false });
+    logPre(ctx, input, nowMs, { decision: 'skip', path: gate.key });
     return null;
   }
 
   // Deny. Delete any pre-file left by a prior invocation so no stale pre_sha
   // survives (PRD §496).
   if (gate.key) deletePreFile(ctx.stateDir, ctx.sid, gate.key, toolUseId, 'write');
-  logPre(ctx, input, nowMs, { decision: 'block', deny_code: gate.denyCode, gate_applicable: true });
+  logPre(ctx, input, nowMs, { decision: 'block', denyCode: gate.denyCode, path: gate.key || null, gateApplicable: true });
   return { denyCode: gate.denyCode, reason: gate.reason };
 }
 
 function main() {
+  const dryRun = process.argv.includes('--dry-run');
   let input;
   try {
     const raw = readStdin();
@@ -92,12 +101,14 @@ function main() {
   } catch (err) {
     // INPUT_PARSE (auto-unblock=Yes): a malformed hook payload is a harness
     // fault, not a gate-bypass — fail soft rather than brick every tool call.
+    if (dryRun) return runDryRunCli(null, {}, { skipReason: 'input_parse' });
     process.stderr.write(`[eghs] pre-tool-use: stdin parse failed (allow): ${err.message}\n`);
     return;
   }
 
   const hookKind = TOOL_KINDS[input.tool_name];
   const filePath = input.tool_input && input.tool_input.file_path;
+  if (dryRun) return runDryRunCli(hookKind && typeof filePath === 'string' ? hookKind : null, input);
   if (!hookKind || typeof filePath !== 'string') return; // not our tool: allow
 
   const nowMs = Date.now();

@@ -88,7 +88,7 @@ function evaluateGate(ctx, filePath, { nowMs }) {
   const denyCode = markerDeny(stateDir, key, sid, lease.start_ms);
   if (denyCode) return { allow: false, denyCode, key };
 
-  return { allow: true, preSha: state.sha, key };
+  return { allow: true, preSha: state.sha, key, evidence: state.evidence };
 }
 
 module.exports = { evaluateGate };

@@ -17,6 +17,7 @@ const { readReadState } = require('./lib/read-state');
 const { listPreFilesForHash } = require('./lib/pre-file');
 const { isValidSid } = require('./lib/sid');
 const { isAlive } = require('./lib/proc');
+const { evaluateDryRun } = require('./lib/dry-run');
 
 function readJson(p) {
   try {
@@ -84,7 +85,17 @@ function dryRun(stateDir, repoRoot, caseless, input) {
   const key = resolved.key;
   const hash = keyHash(key);
   const sid = isValidSid(input.session_id) ? input.session_id : null;
+  // The same normative decision the hook's own `--dry-run` prints (PRD §858),
+  // so inspect stays the gate's preview instead of a second opinion.
+  const hookKind = input.tool_name === 'Read' ? 'pre-read' : 'pre-write';
+  const decision = evaluateDryRun(hookKind, input, { env: process.env, cwd: repoRoot, nowMs: Date.now() });
   return {
+    decision: {
+      decision: decision.decision,
+      deny_code: decision.denyCode || null,
+      reason: decision.reason || null,
+      would_write: decision.wouldWrite,
+    },
     file: filePath,
     key,
     key_hash: hash,
