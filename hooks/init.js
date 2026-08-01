@@ -7,7 +7,7 @@ const { readSchemaVersion, HOOK_SCHEMA_VERSION } = require('./lib/schema');
 const { readFsInfo, probeAndWriteFsInfo, FlockUnsupportedError } = require('./lib/fs-info');
 const { atomicWriteFile } = require('./lib/atomic-write');
 const { getRepoRoot } = require('./lib/git');
-const { acquireExWithTimeout, flockUn } = require('./lib/flock');
+const { lockBodySane, acquireAdminMutex } = require('./lib/admin-lock');
 const { isAlive } = require('./lib/proc');
 
 // eghs-init bootstrap per PRD §R2.5 steps 0-8 (R16-R20 amendments):
@@ -17,9 +17,6 @@ const { isAlive } = require('./lib/proc');
 
 const MIGRATE_LOCK_GRACE_MS = 600000; // hook precedence #4 same-uid dead grace
 const INIT_LOCK_GRACE_MS = 60000; // stale-dead .init.lock recovery grace (NOT a clock-skew tolerance)
-const FAR_FUTURE_GRACE_MS = 86400000; // start_ms sanity ceiling (clock skew / VM resume pass; corruption fails)
-// Env override exists for tests only — a held mutex is a 30s stall otherwise.
-const ADMIN_MUTEX_TIMEOUT_MS = Number(process.env.EGHS_ADMIN_MUTEX_TIMEOUT_MS) || 30000;
 
 class InitAbort extends Error {}
 
@@ -27,47 +24,12 @@ function abort(msg) {
   throw new InitAbort(`[eghs-init] ${msg}`);
 }
 
-// PRD §357: field-level sanity. A body that parses but fails these is
-// corrupt (silent-deadlock prevention), remediation --clear-init-lock.
-function lockBodySane(body, nowMs) {
-  return (
-    body !== null &&
-    typeof body === 'object' &&
-    typeof body.pid === 'number' &&
-    Number.isInteger(body.pid) &&
-    body.pid >= 0 &&
-    body.pid <= Number.MAX_SAFE_INTEGER &&
-    typeof body.uid === 'number' &&
-    Number.isInteger(body.uid) &&
-    typeof body.start_ms === 'number' &&
-    Number.isInteger(body.start_ms) &&
-    body.start_ms >= 0 &&
-    body.start_ms <= Number.MAX_SAFE_INTEGER &&
-    body.start_ms <= nowMs + FAR_FUTURE_GRACE_MS
-  );
-}
-
-// Step 0 (PRD §345): the admin mutex serializes every admin op
-// (eghs-init / eghs-migrate / --clear-*) — only inside it may
-// migrate.lock/.init.lock be created, inspected, or unlinked.
-function acquireAdminMutex(stateDir) {
-  fs.mkdirSync(path.join(stateDir, 'locks'), { recursive: true, mode: 0o700 });
-  const fd = fs.openSync(
-    path.join(stateDir, 'locks', 'admin-mutex.guard'),
-    fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_CLOEXEC, // no truncate: another holder's flock is on this inode
-    0o600
-  );
-  if (!acquireExWithTimeout(fd, ADMIN_MUTEX_TIMEOUT_MS).ok) {
-    fs.closeSync(fd);
-    abort('admin-mutex.guard held by another admin operation; retry later');
-  }
-  return () => {
-    try {
-      flockUn(fd);
-    } finally {
-      fs.closeSync(fd);
-    }
-  };
+// Step 0 (PRD §345), bootstrap-safe: init is the one admin op allowed to
+// create locks/ before taking the mutex.
+function acquireInitAdminMutex(stateDir) {
+  const mutex = acquireAdminMutex(stateDir, { create: true });
+  if (!mutex.ok) abort(mutex.reason);
+  return mutex.release;
 }
 
 // Steps 1-2 (PRD §346-347): reclaim a same-uid dead+grace-elapsed
@@ -211,7 +173,7 @@ function main(argv) {
   const nowMs = Date.now();
   fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
 
-  const releaseMutex = acquireAdminMutex(stateDir);
+  const releaseMutex = acquireInitAdminMutex(stateDir);
   try {
     const releaseMigrateLock = acquireMigrateLock(stateDir, nowMs);
     try {

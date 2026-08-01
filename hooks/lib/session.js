@@ -131,21 +131,23 @@ function deleteTarget({ p, dir }) {
   }
 }
 
-// PRD §R2.5 sessions/ GC (R16-R20: cascade-before-lease): only leases with
-// (stale by time, same uid, dead pid) are candidates. A foreign-uid dead
-// lease is left alone — only `eghs-migrate --force-foreign-cleanup` may
-// remove those. Cascade runs FIRST; the lease is unlinked only when every
-// target succeeded, so a partial cascade stays retryable.
-function gcSessions(stateDir, { nowMs, uid, sessionStaleSeconds = 86400, onEvent }) {
+// GC candidate selection (PRD §R2.5 sessions/ GC): only leases with (stale by
+// time, same uid, dead pid) qualify. A foreign-uid dead lease is left alone
+// unless `foreignStaleSeconds` is set — that is `eghs-migrate
+// --force-foreign-cleanup` only (PRD §241), and it is TTL-only on purpose:
+// kill(0) against a foreign pid returns EPERM, so liveness is undecidable.
+// Exported so eghs-migrate --dry-run can report the plan without deleting.
+function selectStaleSids(stateDir, { nowMs, uid, sessionStaleSeconds = 86400, foreignStaleSeconds = null }) {
   const sessionsDir = path.join(stateDir, 'sessions');
   let entries = [];
   try {
     entries = fs.readdirSync(sessionsDir).filter((f) => f.endsWith('.json'));
   } catch (err) {
-    if (err.code === 'ENOENT') return;
+    if (err.code === 'ENOENT') return [];
     throw err;
   }
 
+  const selected = [];
   for (const entry of entries) {
     const filePath = path.join(sessionsDir, entry);
     const sid = entry.slice(0, -'.json'.length);
@@ -157,13 +159,32 @@ function gcSessions(stateDir, { nowMs, uid, sessionStaleSeconds = 86400, onEvent
     }
     if (!body) continue; // vanished mid-scan -> leave for a later pass
 
-    const staleByTime = nowMs - body.renewed_ms > sessionStaleSeconds * 1000;
-    if (!staleByTime || body.uid !== uid || isAlive(body.pid)) continue;
+    if (body.uid === uid) {
+      const staleByTime = nowMs - body.renewed_ms > sessionStaleSeconds * 1000;
+      if (!staleByTime || isAlive(body.pid)) continue;
+    } else {
+      if (foreignStaleSeconds === null) continue;
+      if (nowMs - body.renewed_ms <= foreignStaleSeconds * 1000) continue;
+    }
 
     // A tombstone means --clear-sid owns this sid right now; its cascade is
     // that command's job, not ours.
     if (fs.existsSync(path.join(sessionsDir, `${sid}.tombstone`))) continue;
+    selected.push({ sid, filePath, body });
+  }
+  return selected;
+}
 
+// PRD §R2.5 sessions/ GC (R16-R20: cascade-before-lease). Cascade runs FIRST;
+// the lease is unlinked only when every target succeeded, so a partial cascade
+// stays retryable.
+function gcSessions(stateDir, { nowMs, uid, sessionStaleSeconds = 86400, foreignStaleSeconds = null, onEvent }) {
+  for (const { sid, filePath, body } of selectStaleSids(stateDir, {
+    nowMs,
+    uid,
+    sessionStaleSeconds,
+    foreignStaleSeconds,
+  })) {
     const failedTargets = cascadeTargets(stateDir, sid)
       .filter((t) => !deleteTarget(t))
       .map((t) => t.p);
@@ -224,4 +245,10 @@ function sweepOrphanTombstones(stateDir, { nowMs, uid, tombstoneStaleSeconds = 3
   }
 }
 
-module.exports = { ensureSessionLease, gcSessions, sweepOrphanTombstones, SidCollisionError };
+module.exports = {
+  ensureSessionLease,
+  selectStaleSids,
+  gcSessions,
+  sweepOrphanTombstones,
+  SidCollisionError,
+};
