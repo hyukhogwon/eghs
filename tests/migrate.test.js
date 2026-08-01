@@ -374,3 +374,340 @@ test('eghs-migrate rejects unknown options', () => {
   assert.notEqual(r.status, 0);
   assert.match(r.stderr, /--nope/);
 });
+
+// ---- unit 13: --clear-sid (PRD §R2.5 §301-323) ----
+
+function initedRepo() {
+  const repo = mkTmpRepo();
+  init(repo);
+  return repo;
+}
+
+function seedSid(repo, sid, leaseBody) {
+  const stateDir = stateDirOf(repo);
+  if (leaseBody !== null) writeLease(repo, sid, leaseBody);
+  fs.writeFileSync(path.join(stateDir, 'baselines', `${sid}.txt`), '{}');
+  fs.writeFileSync(path.join(stateDir, 'debug', `${sid}.jsonl`), '');
+  fs.mkdirSync(path.join(stateDir, 'verify-logs', sid), { recursive: true });
+  fs.mkdirSync(path.join(stateDir, 'pre', sid), { recursive: true });
+  fs.mkdirSync(path.join(stateDir, 'failed', sid), { recursive: true });
+  fs.writeFileSync(path.join(stateDir, 'locks', `stop-${sid}.lock`), '{}');
+  fs.writeFileSync(
+    path.join(stateDir, 'failed', 'keyscoped.json'),
+    JSON.stringify({ schema_version: 1, origin_sid: sid, ts_ms: 1, reason: 'x' })
+  );
+}
+
+function sidResidue(repo, sid) {
+  const stateDir = stateDirOf(repo);
+  return [
+    path.join(stateDir, 'sessions', `${sid}.json`),
+    path.join(stateDir, 'sessions', `${sid}.guard.lock`),
+    path.join(stateDir, 'sessions', `${sid}.tombstone`),
+    path.join(stateDir, 'baselines', `${sid}.txt`),
+    path.join(stateDir, 'debug', `${sid}.jsonl`),
+    path.join(stateDir, 'verify-logs', sid),
+    path.join(stateDir, 'pre', sid),
+    path.join(stateDir, 'failed', sid),
+    path.join(stateDir, 'locks', `stop-${sid}.lock`),
+    path.join(stateDir, 'failed', 'keyscoped.json'),
+  ].filter((p) => fs.existsSync(p));
+}
+
+test('--clear-sid removes a dead sid with its full cascade and cleans up after itself', () => {
+  const repo = initedRepo();
+  seedSid(repo, SID, {
+    pid: deadPid(),
+    uid: process.getuid(),
+    start_ms: Date.now(),
+    renewed_ms: Date.now(),
+  });
+  const r = migrate(['--clear-sid', SID], repo);
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(sidResidue(repo, SID), []);
+  assert.ok(!fs.existsSync(path.join(stateDirOf(repo), 'migrate.lock')));
+});
+
+test('--clear-sid leaves other sids untouched', () => {
+  const repo = initedRepo();
+  const other = '22222222-2222-4222-8222-222222222222';
+  seedSid(repo, SID, { pid: deadPid(), uid: process.getuid(), start_ms: 1, renewed_ms: 1 });
+  seedSid(repo, other, { pid: process.pid, uid: process.getuid(), start_ms: 1, renewed_ms: 1 });
+  assert.equal(migrate(['--clear-sid', SID], repo).status, 0);
+  assert.ok(fs.existsSync(path.join(stateDirOf(repo), 'sessions', `${other}.json`)));
+  assert.ok(fs.existsSync(path.join(stateDirOf(repo), 'baselines', `${other}.txt`)));
+});
+
+test('--clear-sid refuses a live lease without --force', () => {
+  const repo = initedRepo();
+  seedSid(repo, SID, { pid: process.pid, uid: process.getuid(), start_ms: 1, renewed_ms: 1 });
+  const r = migrate(['--clear-sid', SID], repo);
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /lease pid alive; refusing without --force/);
+  assert.ok(fs.existsSync(path.join(stateDirOf(repo), 'sessions', `${SID}.json`)));
+  assert.ok(!fs.existsSync(path.join(stateDirOf(repo), 'sessions', `${SID}.tombstone`)));
+});
+
+test('--clear-sid --force clears a live lease through the tombstone barrier', () => {
+  const repo = initedRepo();
+  seedSid(repo, SID, { pid: process.pid, uid: process.getuid(), start_ms: 1, renewed_ms: 1 });
+  const r = migrate(['--clear-sid', SID, '--force'], repo);
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(sidResidue(repo, SID), []);
+});
+
+test('--clear-sid refuses a corrupt lease body without --force', () => {
+  const repo = initedRepo();
+  seedSid(repo, SID, null);
+  fs.writeFileSync(path.join(stateDirOf(repo), 'sessions', `${SID}.json`), '{ nope');
+  const r = migrate(['--clear-sid', SID], repo);
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /lease body corrupt; --force required/);
+});
+
+test('--clear-sid --force clears a corrupt lease body', () => {
+  const repo = initedRepo();
+  seedSid(repo, SID, null);
+  fs.writeFileSync(path.join(stateDirOf(repo), 'sessions', `${SID}.json`), '{ nope');
+  const r = migrate(['--clear-sid', SID, '--force'], repo);
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(sidResidue(repo, SID), []);
+});
+
+test('--clear-sid rejects a foreign-uid lease and names --force-foreign-cleanup', () => {
+  const repo = initedRepo();
+  seedSid(repo, SID, { pid: deadPid(), uid: process.getuid() + 1, start_ms: 1, renewed_ms: 1 });
+  const r = migrate(['--clear-sid', SID, '--force'], repo);
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /foreign uid; use --force-foreign-cleanup instead/);
+});
+
+test('--clear-sid --force-foreign-cleanup clears a foreign-uid lease', () => {
+  const repo = initedRepo();
+  seedSid(repo, SID, { pid: deadPid(), uid: process.getuid() + 1, start_ms: 1, renewed_ms: 1 });
+  const r = migrate(['--clear-sid', SID, '--force-foreign-cleanup'], repo);
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(sidResidue(repo, SID), []);
+});
+
+test('--clear-sid works when the lease is absent (baseline-only corruption)', () => {
+  const repo = initedRepo();
+  seedSid(repo, SID, null);
+  const r = migrate(['--clear-sid', SID], repo);
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(sidResidue(repo, SID), []);
+});
+
+test('--clear-sid rejects a non-UUIDv4 sid', () => {
+  const repo = initedRepo();
+  const r = migrate(['--clear-sid', '../../etc'], repo);
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /UUIDv4/);
+});
+
+test('--clear-sid aborts when hooks do not drain, leaving the tombstone in place', () => {
+  const repo = initedRepo();
+  seedSid(repo, SID, { pid: deadPid(), uid: process.getuid(), start_ms: 1, renewed_ms: 1 });
+  const guard = path.join(stateDirOf(repo), 'sessions', `${SID}.guard.lock`);
+  const sentinel = path.join(repo, 'guard-held');
+  const holder = spawn('node', ['-e', `
+    const fs = require('fs');
+    const { flockSync } = require(${JSON.stringify(require.resolve('fs-ext'))});
+    const fd = fs.openSync(${JSON.stringify(guard)}, 'w');
+    flockSync(fd, 'shnb');
+    fs.writeFileSync(${JSON.stringify(sentinel)}, '1');
+    setTimeout(() => {}, 10000);
+  `]);
+  try {
+    const t0 = Date.now();
+    while (!fs.existsSync(sentinel) && Date.now() - t0 < 5000) {
+      spawnSync('node', ['-e', 'setTimeout(()=>{},10)']);
+    }
+    assert.ok(fs.existsSync(sentinel), 'holder never took the guard');
+    const r = migrate(['--clear-sid', SID], repo, { EGHS_CLEAR_SID_WAIT_MS: '300' });
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /drain/);
+    assert.ok(fs.existsSync(path.join(stateDirOf(repo), 'sessions', `${SID}.tombstone`)));
+    assert.ok(fs.existsSync(path.join(stateDirOf(repo), 'sessions', `${SID}.json`)));
+    assert.ok(!fs.existsSync(path.join(stateDirOf(repo), 'migrate.lock')));
+  } finally {
+    holder.kill('SIGKILL');
+  }
+});
+
+test('--clear-sid resumes from a same-uid dead clearer tombstone', () => {
+  const repo = initedRepo();
+  seedSid(repo, SID, { pid: deadPid(), uid: process.getuid(), start_ms: 1, renewed_ms: 1 });
+  fs.writeFileSync(
+    path.join(stateDirOf(repo), 'sessions', `${SID}.tombstone`),
+    JSON.stringify({ cleared_by_pid: deadPid(), cleared_by_uid: process.getuid(), ts_ms: 1, reason: 'clear-sid' })
+  );
+  const r = migrate(['--clear-sid', SID], repo);
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(sidResidue(repo, SID), []);
+});
+
+test('--clear-sid aborts on a tombstone held by a live clearer', () => {
+  const repo = initedRepo();
+  seedSid(repo, SID, { pid: deadPid(), uid: process.getuid(), start_ms: 1, renewed_ms: 1 });
+  fs.writeFileSync(
+    path.join(stateDirOf(repo), 'sessions', `${SID}.tombstone`),
+    JSON.stringify({ cleared_by_pid: process.pid, cleared_by_uid: process.getuid(), ts_ms: 1, reason: 'clear-sid' })
+  );
+  const r = migrate(['--clear-sid', SID], repo);
+  assert.notEqual(r.status, 0);
+  assert.ok(fs.existsSync(path.join(stateDirOf(repo), 'sessions', `${SID}.json`)));
+});
+
+test('--clear-sid aborts while a migrate.lock is held', () => {
+  const repo = initedRepo();
+  seedSid(repo, SID, { pid: deadPid(), uid: process.getuid(), start_ms: 1, renewed_ms: 1 });
+  fs.writeFileSync(
+    path.join(stateDirOf(repo), 'migrate.lock'),
+    JSON.stringify({ pid: process.pid, uid: process.getuid(), start_ms: Date.now(), role: 'migrate' })
+  );
+  const r = migrate(['--clear-sid', SID], repo);
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /migrate\.lock/);
+  assert.ok(fs.existsSync(path.join(stateDirOf(repo), 'sessions', `${SID}.json`)));
+});
+
+// ---- unit 13: --clear-migrate-lock / --clear-init-lock (PRD §324-343) ----
+
+test('--clear-migrate-lock is a no-op when the lock is absent', () => {
+  const repo = initedRepo();
+  const r = migrate(['--clear-migrate-lock'], repo);
+  assert.equal(r.status, 0, r.stderr);
+});
+
+test('--clear-migrate-lock unlinks a symlink without following it', () => {
+  const repo = initedRepo();
+  const target = path.join(repo, 'precious.txt');
+  fs.writeFileSync(target, 'keep me');
+  fs.symlinkSync(target, path.join(stateDirOf(repo), 'migrate.lock'));
+  const r = migrate(['--clear-migrate-lock'], repo);
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(!fs.existsSync(path.join(stateDirOf(repo), 'migrate.lock')));
+  assert.equal(fs.readFileSync(target, 'utf8'), 'keep me');
+});
+
+test('--clear-migrate-lock removes a FIFO without opening it', () => {
+  const repo = initedRepo();
+  const lockPath = path.join(stateDirOf(repo), 'migrate.lock');
+  assert.equal(spawnSync('mkfifo', [lockPath]).status, 0);
+  const r = migrate(['--clear-migrate-lock'], repo);
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(!fs.existsSync(lockPath));
+});
+
+test('--clear-migrate-lock rmdirs an empty directory but refuses a non-empty one', () => {
+  const repo = initedRepo();
+  const lockPath = path.join(stateDirOf(repo), 'migrate.lock');
+  fs.mkdirSync(lockPath);
+  fs.writeFileSync(path.join(lockPath, 'stuff'), 'x');
+  const refused = migrate(['--clear-migrate-lock'], repo);
+  assert.notEqual(refused.status, 0);
+  assert.match(refused.stderr, /not empty/);
+  fs.rmSync(path.join(lockPath, 'stuff'));
+  const r = migrate(['--clear-migrate-lock'], repo);
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(!fs.existsSync(lockPath));
+});
+
+test('--clear-migrate-lock removes a corrupt-body regular lock', () => {
+  const repo = initedRepo();
+  const lockPath = path.join(stateDirOf(repo), 'migrate.lock');
+  fs.writeFileSync(lockPath, '{ nope');
+  assert.equal(migrate(['--clear-migrate-lock'], repo).status, 0);
+  assert.ok(!fs.existsSync(lockPath));
+});
+
+test('--clear-migrate-lock refuses a live lock', () => {
+  const repo = initedRepo();
+  const lockPath = path.join(stateDirOf(repo), 'migrate.lock');
+  fs.writeFileSync(
+    lockPath,
+    JSON.stringify({ pid: process.pid, uid: process.getuid(), start_ms: Date.now(), role: 'migrate' })
+  );
+  const r = migrate(['--clear-migrate-lock'], repo);
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, new RegExp(`held by pid=${process.pid}`));
+  assert.ok(fs.existsSync(lockPath));
+});
+
+test('--clear-migrate-lock refuses a dead lock still within its grace', () => {
+  const repo = initedRepo();
+  const lockPath = path.join(stateDirOf(repo), 'migrate.lock');
+  fs.writeFileSync(
+    lockPath,
+    JSON.stringify({ pid: deadPid(), uid: process.getuid(), start_ms: Date.now(), role: 'migrate' })
+  );
+  const r = migrate(['--clear-migrate-lock'], repo);
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /grace/);
+  assert.ok(fs.existsSync(lockPath));
+});
+
+test('--clear-migrate-lock removes a dead lock past its grace', () => {
+  const repo = initedRepo();
+  const lockPath = path.join(stateDirOf(repo), 'migrate.lock');
+  fs.writeFileSync(
+    lockPath,
+    JSON.stringify({ pid: deadPid(), uid: process.getuid(), start_ms: Date.now() - 700000, role: 'migrate' })
+  );
+  assert.equal(migrate(['--clear-migrate-lock'], repo).status, 0);
+  assert.ok(!fs.existsSync(lockPath));
+});
+
+test('--clear-migrate-lock treats a body uid that disagrees with st_uid as corrupt', () => {
+  const repo = initedRepo();
+  const lockPath = path.join(stateDirOf(repo), 'migrate.lock');
+  fs.writeFileSync(
+    lockPath,
+    JSON.stringify({ pid: process.pid, uid: process.getuid() + 1, start_ms: Date.now(), role: 'migrate' })
+  );
+  assert.equal(migrate(['--clear-migrate-lock'], repo).status, 0);
+  assert.ok(!fs.existsSync(lockPath));
+});
+
+test('--clear-init-lock removes a corrupt .init.lock and unblocks eghs-init --repair', () => {
+  const repo = initedRepo();
+  const lockPath = path.join(stateDirOf(repo), '.init.lock');
+  fs.writeFileSync(lockPath, '{ nope');
+  assert.equal(migrate(['--clear-init-lock'], repo).status, 0);
+  assert.ok(!fs.existsSync(lockPath));
+  assert.equal(spawnSync('node', [INIT_SCRIPT, '--repair'], { cwd: repo, encoding: 'utf8' }).status, 0);
+});
+
+test('--clear-init-lock refuses a live .init.lock', () => {
+  const repo = initedRepo();
+  const lockPath = path.join(stateDirOf(repo), '.init.lock');
+  fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, uid: process.getuid(), start_ms: Date.now() }));
+  const r = migrate(['--clear-init-lock'], repo);
+  assert.notEqual(r.status, 0);
+  assert.ok(fs.existsSync(lockPath));
+});
+
+test('--clear-init-lock removes a dead .init.lock past its 60s grace', () => {
+  const repo = initedRepo();
+  const lockPath = path.join(stateDirOf(repo), '.init.lock');
+  fs.writeFileSync(
+    lockPath,
+    JSON.stringify({ pid: deadPid(), uid: process.getuid(), start_ms: Date.now() - 61000 })
+  );
+  assert.equal(migrate(['--clear-init-lock'], repo).status, 0);
+  assert.ok(!fs.existsSync(lockPath));
+});
+
+test('the clear-* commands are mutually exclusive and reject --dry-run', () => {
+  const repo = initedRepo();
+  const both = migrate(['--clear-migrate-lock', '--clear-init-lock'], repo);
+  assert.notEqual(both.status, 0);
+  assert.match(both.stderr, /one command/);
+  const dry = migrate(['--clear-migrate-lock', '--dry-run'], repo);
+  assert.notEqual(dry.status, 0);
+  assert.match(dry.stderr, /--dry-run/);
+  const stray = migrate(['--force'], repo);
+  assert.notEqual(stray.status, 0);
+  assert.match(stray.stderr, /--force/);
+});

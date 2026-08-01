@@ -250,5 +250,6 @@ module.exports = {
   selectStaleSids,
   gcSessions,
   sweepOrphanTombstones,
+  cascadeTargets, // eghs-migrate --clear-sid reuses the verbatim cascade set
   SidCollisionError,
 };
