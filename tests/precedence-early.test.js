@@ -93,10 +93,22 @@ test('#1/#3.7 clean-install fast-path: schema absent → no guard, no tombstone 
 test('#3.3 unhealthy fs-info (schema present) → INFRA_NOT_READY candidate, reason infra_not_ready', () => {
   const repo = mkRepo();
   fs.writeFileSync(path.join(stateDirOf(repo), 'fs-info.json'), '{ corrupt');
-  const r = run('pre-write', repo);
+  const { result: r, stderr } = captureStderr(() => run('pre-write', repo));
   assert.equal(r.outcome, 'candidate');
   assert.equal(r.candidate, 'INFRA_NOT_READY');
   assert.equal(r.reason, 'infra_not_ready');
+  // The remediation line IS the user-facing contract for this row (PRD §681-685).
+  assert.match(stderr, /fs-info\.json corrupt; run: eghs-init --repair/);
+});
+
+test('#3.3 flock_ok !== true names the flock case on stderr, not the generic corrupt one', () => {
+  const repo = mkRepo();
+  const p = path.join(stateDirOf(repo), 'fs-info.json');
+  const body = JSON.parse(fs.readFileSync(p, 'utf8'));
+  fs.writeFileSync(p, JSON.stringify({ ...body, flock_ok: false }));
+  const { result: r, stderr } = captureStderr(() => run('pre-write', repo));
+  assert.equal(r.candidate, 'INFRA_NOT_READY');
+  assert.match(stderr, /flock_ok not true; run: eghs-init --repair/);
 });
 
 test('#3.3 MISSING fs-info defers to #7 (continue, fsInfo status carried in ctx)', () => {
@@ -143,9 +155,12 @@ test('#3.7 tombstone present → sid_cleared candidate, guard never created', ()
 test('#3.7 sessions/ dir manually deleted (schema present) → infra_not_ready candidate', () => {
   const repo = mkRepo();
   fs.rmSync(path.join(stateDirOf(repo), 'sessions'), { recursive: true, force: true });
-  const r = run('pre-write', repo);
+  const { result: r, stderr } = captureStderr(() => run('pre-write', repo));
   assert.equal(r.outcome, 'candidate');
   assert.equal(r.reason, 'infra_not_ready');
+  // ENOENT is the only guard failure that earns repair guidance (PRD §706).
+  assert.match(stderr, /sessions\/ missing; run: eghs-init --repair/);
+  assert.ok(!fs.existsSync(path.join(stateDirOf(repo), 'sessions')), 'must not recreate the dir');
 });
 
 test('#3.7 normal path: shared guard held for the hook lifetime (child EX would-block)', () => {

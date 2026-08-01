@@ -127,3 +127,38 @@ test('matrix: PreToolUse Write/Read → deny with the candidate code and auto-un
     assert.equal(col.autoUnblock, false);
   }
 });
+
+// ---- P4 finale: the read rows must stay mutation-free under a live lock ----
+
+test('#4 a live migrate.lock leaves the state dir byte-identical for the read rows', () => {
+  const { execFileSync } = require('child_process');
+  const { runPrecedence } = require('../hooks/lib/precedence');
+  const repo = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'eghs-mlock-repo-')));
+  execFileSync('git', ['init', '-q'], { cwd: repo });
+  execFileSync('node', [path.join(__dirname, '..', 'hooks', 'init.js')], { cwd: repo });
+  const stateDir = path.join(repo, '.claude', 'state', 'eghs');
+  writeLock(stateDir, { pid: process.pid, uid: UID, start_ms: Date.now(), role: 'migrate' });
+
+  const snapshot = () =>
+    fs
+      .readdirSync(stateDir, { recursive: true })
+      .sort()
+      .join('\n');
+  const before = snapshot();
+
+  for (const kind of ['post-read', 'ups']) {
+    const r = runPrecedence(kind, { session_id: '11111111-1111-4111-8111-111111111111' }, {
+      env: {},
+      cwd: repo,
+      nowMs: Date.now(),
+    });
+    assert.notEqual(r.outcome, 'continue');
+  }
+  // The guard.lock create in #3.7 is the one sanctioned write; nothing else
+  // (no lease, no baseline, no debug log) may appear while migrate holds.
+  const after = snapshot()
+    .split('\n')
+    .filter((n) => !n.endsWith('.guard.lock'))
+    .join('\n');
+  assert.equal(after, before);
+});

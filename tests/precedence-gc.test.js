@@ -107,3 +107,39 @@ test('#5b: a sid with a tombstone is skipped (clear-sid owns its cascade)', () =
   gcPass(ctxFor(repo), CFG);
   assert.ok(fs.existsSync(path.join(sd, 'sessions', `${DEAD_SID}.json`)), 'tombstoned sid must be left to --clear-sid');
 });
+
+// ---- P4 finale: orphan baseline sweep ----
+
+test('#5b: a baseline with no lease, aged past the grace, is swept', () => {
+  const repo = mkRepo();
+  const sd = stateDirOf(repo);
+  const bp = path.join(sd, 'baselines', `${DEAD_SID}.txt`);
+  fs.writeFileSync(bp, '{}');
+  const old = Date.now() / 1000 - 7200;
+  fs.utimesSync(bp, old, old);
+  assert.equal(gcPass(ctxFor(repo), CFG), null);
+  assert.ok(!fs.existsSync(bp));
+});
+
+test('#5b: a fresh baseline with no lease is kept (grace covers the write window)', () => {
+  const repo = mkRepo();
+  const bp = path.join(stateDirOf(repo), 'baselines', `${DEAD_SID}.txt`);
+  fs.writeFileSync(bp, '{}');
+  assert.equal(gcPass(ctxFor(repo), CFG), null);
+  assert.ok(fs.existsSync(bp));
+});
+
+test('#5b: a baseline whose lease still exists is never swept, however old', () => {
+  const repo = mkRepo();
+  const sd = stateDirOf(repo);
+  fs.writeFileSync(
+    path.join(sd, 'sessions', `${SID}.json`),
+    JSON.stringify({ pid: process.pid, uid: process.getuid(), start_ms: 1, renewed_ms: Date.now() })
+  );
+  const bp = path.join(sd, 'baselines', `${SID}.txt`);
+  fs.writeFileSync(bp, '{}');
+  const old = Date.now() / 1000 - 7200;
+  fs.utimesSync(bp, old, old);
+  assert.equal(gcPass(ctxFor(repo), CFG), null);
+  assert.ok(fs.existsSync(bp));
+});

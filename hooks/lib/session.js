@@ -245,11 +245,39 @@ function sweepOrphanTombstones(stateDir, { nowMs, uid, tombstoneStaleSeconds = 3
   }
 }
 
+// Orphan baseline sweep (#5b, P4 finale). A baseline is normally removed by
+// the sessions cascade, so one whose lease is gone by any other route (a
+// hand-deleted lease, a cascade that only later succeeded on the lease) would
+// otherwise survive forever — §G5 says no unbounded disk growth. The lease is
+// always written before its baseline, so "baseline without lease" can only
+// mean debris; the mtime grace covers any interleaving we have not thought of.
+function sweepOrphanBaselines(stateDir, { nowMs, staleSeconds = 3600 }) {
+  const baselinesDir = path.join(stateDir, 'baselines');
+  let names = [];
+  try {
+    names = fs.readdirSync(baselinesDir).filter((n) => n.endsWith('.txt'));
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    const sid = name.slice(0, -'.txt'.length);
+    if (fs.existsSync(leasePath(stateDir, sid))) continue;
+    const p = path.join(baselinesDir, name);
+    try {
+      if (nowMs - fs.statSync(p).mtimeMs < staleSeconds * 1000) continue;
+      fs.unlinkSync(p);
+    } catch {
+      // vanished or unreadable -> nothing to do
+    }
+  }
+}
+
 module.exports = {
   ensureSessionLease,
   selectStaleSids,
   gcSessions,
   sweepOrphanTombstones,
+  sweepOrphanBaselines,
   cascadeTargets, // eghs-migrate --clear-sid reuses the verbatim cascade set
   SidCollisionError,
 };

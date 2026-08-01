@@ -711,3 +711,26 @@ test('the clear-* commands are mutually exclusive and reject --dry-run', () => {
   assert.notEqual(stray.status, 0);
   assert.match(stray.stderr, /--force/);
 });
+
+// ---- P4 finale: orphan sid-scoped marker dirs ----
+
+test('eghs-migrate removes orphan failed/<sid>/ dirs during the record wipe', () => {
+  const repo = repoNeedingMigrate();
+  const stateDir = stateDirOf(repo);
+  fs.mkdirSync(path.join(stateDir, 'failed', SID), { recursive: true });
+  fs.writeFileSync(path.join(stateDir, 'failed', SID, 'aa.json'), '{}');
+  const r = migrate([], repo);
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(!fs.existsSync(path.join(stateDir, 'failed', SID)));
+  assert.ok(fs.statSync(path.join(stateDir, 'failed', 'tmp')).isDirectory(), 'failed/tmp must survive');
+});
+
+test('eghs-migrate --dry-run counts orphan marker dirs without removing them', () => {
+  const repo = repoNeedingMigrate();
+  const stateDir = stateDirOf(repo);
+  fs.mkdirSync(path.join(stateDir, 'failed', SID), { recursive: true });
+  const r = migrate(['--dry-run'], repo);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /would remove 1 orphan sid-scoped marker dir/);
+  assert.ok(fs.existsSync(path.join(stateDir, 'failed', SID)));
+});

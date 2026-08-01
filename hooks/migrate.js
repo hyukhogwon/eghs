@@ -221,14 +221,31 @@ function listRecords(stateDir, sub) {
   }
 }
 
+// sid-scoped marker dirs left behind by a cascade that hit EPERM. Step 5 has
+// already proven sessions/ empty, so every one of these is an orphan — and the
+// cascade that failed on them is their only other GC path.
+function listOrphanMarkerDirs(stateDir) {
+  const failedDir = path.join(stateDir, 'failed');
+  try {
+    return fs
+      .readdirSync(failedDir, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && e.name !== 'tmp')
+      .map((e) => path.join(failedDir, e.name));
+  } catch {
+    return [];
+  }
+}
+
 // Steps 6-7 (PRD §397-403): a schema change invalidates every cross-session
 // evidence record (G1 over convenience — a Read regenerates them), then the
 // version file is rewritten atomically. fs-info.json is schema-agnostic and
 // deliberately kept.
 function migrateRecords(stateDir, { dryRun, trace }) {
   const records = [...listRecords(stateDir, 'reads'), ...listRecords(stateDir, 'failed')];
+  const orphanDirs = listOrphanMarkerDirs(stateDir);
   if (dryRun) {
     trace(`would unlink ${records.length} evidence record(s) under reads/ and failed/`);
+    trace(`would remove ${orphanDirs.length} orphan sid-scoped marker dir(s) under failed/`);
     trace(`would write schema_version=${HOOK_SCHEMA_VERSION}`);
     return;
   }
@@ -237,6 +254,13 @@ function migrateRecords(stateDir, { dryRun, trace }) {
       fs.unlinkSync(p);
     } catch {
       // best-effort: a record that vanished mid-pass is already gone
+    }
+  }
+  for (const p of orphanDirs) {
+    try {
+      fs.rmSync(p, { recursive: true, force: true });
+    } catch {
+      // best-effort: EPERM leaves it for the next run
     }
   }
   atomicWriteFile(path.join(stateDir, 'schema_version'), `${HOOK_SCHEMA_VERSION}\n`);

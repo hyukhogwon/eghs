@@ -237,8 +237,10 @@ function establishLeaseAndBaseline(stateDir, sid, { pid, uid, nowMs, repoRoot, o
       return establishLeaseAndBaseline(stateDir, sid, { pid, uid, nowMs, repoRoot, onEvent }, retriesLeft - 1);
     }
 
-    // vi. baseline write, one shot + the outer retry.
-    const baseBody = { commit: getHeadCommit(repoRoot), lease_start_ms: startMs, lease_pid: pid };
+    // vi. baseline write, one shot + the outer retry. The anchor is copied
+    // from the lease body we just wrote (§785 pattern), not from the locals
+    // it was built from — same values, one source of truth.
+    const baseBody = { commit: getHeadCommit(repoRoot), lease_start_ms: body.start_ms, lease_pid: body.pid };
     if (!exclusiveLinkCreate(baselinePath(stateDir, sid), JSON.stringify(baseBody)).ok) {
       return establishLeaseAndBaseline(stateDir, sid, { pid, uid, nowMs, repoRoot, onEvent }, retriesLeft - 1);
     }

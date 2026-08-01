@@ -10,7 +10,7 @@ const { readFsInfo, selfHealAnchorMismatch } = require('./fs-info');
 const { isValidSid } = require('./sid');
 const { getRepoRoot } = require('./git');
 const { acquireSidGuard } = require('./guard');
-const { gcSessions, sweepOrphanTombstones } = require('./session');
+const { gcSessions, sweepOrphanTombstones, sweepOrphanBaselines } = require('./session');
 const { gcPreFiles } = require('./pre-file');
 const { appendDebugLog, setDebugEnabled } = require('./debug-log');
 const { loadConfig } = require('./config');
@@ -330,6 +330,7 @@ function gcPass(ctx, config) {
       uid,
       tombstoneStaleSeconds: config.tombstone_stale_seconds,
     });
+    sweepOrphanBaselines(stateDir, { nowMs, staleSeconds: config.tombstone_stale_seconds });
     gcPreFiles(stateDir, { nowMs }); // 24h pre/ GC lives HERE, not at hook start
   }
 

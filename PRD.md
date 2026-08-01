@@ -376,11 +376,11 @@ State는 `.claude/state/eghs/` 아래 다음 구조로 저장한다.
        a. 부모: `.claude/state/eghs/tmp/flock-probe.<pid>.<seq>` 경로 `parent_fd = open(O_RDWR|O_CREAT|O_CLOEXEC)` → `flock(parent_fd, LOCK_EX|LOCK_NB)`. 실패(ENOTSUP/EOPNOTSUPP/EINVAL/EWOULDBLOCK) → fail-closed(아래).
        b. `fork()` 후 자식: **상속 fd 사용 금지**. `close(parent_fd)` (또는 이미 O_CLOEXEC로 exec 후 별 프로세스에서 처리) → 동일 경로를 **별도로** `child_fd = open(O_RDWR|O_CLOEXEC)` (O_CREAT 없음, 이미 존재) → `flock(child_fd, LOCK_EX|LOCK_NB)`. **반드시 EWOULDBLOCK 반환해야 정상**. 성공 반환(자식이 lock 획득) 시 flock 지원 안 됨(silent no-op FS). ENOTSUP/EINVAL 등도 동일 실패 처리. 자식은 결과 코드를 exit로 반환.
        c. 부모: 자식 exit 값이 "EWOULDBLOCK expected" 아니면 **fail-closed**: stderr `[eghs-init] flock not supported on this filesystem (likely NFS/CIFS/silent-noop); EGHS requires local POSIX flock-capable FS` + 비-zero exit. 부모 lock 해제 후 probe 파일 unlink.
-       d. 성공 시 `fs-info.json`에 다음 필드 추가: `"flock_ok": true`, `"fs_st_dev": <state root의 st_dev>`, `"fs_statfs_id": <platform-normalized FS type identifier>`. **Platform-normalized `fs_statfs_id`**:
-          * Linux: `statfs.f_type` (integer, e.g. `0xef53` for ext4). 필드명 `fs_statfs_id`에 정수값 그대로 저장.
-          * macOS/BSD: `statfs.f_fstypename` (문자열, e.g. `"apfs"`, `"hfs"`). Linux integer와 구분 위해 문자열로 저장.
-          * 값 저장 시 platform tag 접두어 사용: `"linux:0xef53"` 또는 `"darwin:apfs"`. 비교 시 tag+value 모두 일치해야 정상.
-          * 다른 platform(FreeBSD/Solaris 등): `"posix:<uname 값>"`으로 fallback. 미지원 platform은 §3 Non-goal.
+       d. 성공 시 `fs-info.json`에 다음 필드 추가: `"flock_ok": true`, `"fs_st_dev": <state root의 st_dev>`, `"fs_statfs_id": <platform-normalized FS type identifier>`. **Platform-normalized `fs_statfs_id`** (2026-08-01 개정 — 아래 "구현 형식"이 normative):
+          * **구현 형식(normative)**: `"<process.platform>:<fs.statfsSync(stateRoot).type 10진수>"`. 예: `darwin:26`, `linux:61267`. 비교 시 tag+value 모두 일치해야 정상.
+          * **개정 근거**: Node core는 어느 플랫폼에서든 `fs.statfsSync().type`(숫자)만 노출하며 macOS의 `statfs.f_fstypename` 문자열에 접근할 방법이 없다(fs-ext에도 statfs 없음). 원안(`"darwin:apfs"`)을 지키려면 네이티브 애드온이 필요한데, anchor의 목적(캐시된 probe 결과가 현재 볼륨의 것인지 확인)은 숫자 type으로 동일하게 달성된다 — 값의 가독성만 손해다.
+          * 기존 원안(참고용, 더 이상 구현 기준 아님): Linux `statfs.f_type` 정수 / macOS·BSD `statfs.f_fstypename` 문자열 / 그 외 `"posix:<uname 값>"`.
+          * `fs.statfsSync`가 실패하는 플랫폼: anchor 검증 불가로 취급(`anchor_unverifiable`) — self-heal 없이 fail-closed. 미지원 platform은 §3 Non-goal.
        hook은 매 실행마다 fs-info.json 읽어 `flock_ok !== true` 시 `INFRA_NOT_READY reason=infra_not_ready`로 fail-closed 반환(stderr `run: eghs-init --repair to re-probe`). 또한 매 hook 시작 시 state root의 `st_dev` + platform-normalized statfs id 를 확인해 fs-info.json cache와 불일치 시 **`.init.lock` 하 자동 재 probe self-heal을 시도** — 성공 시 fs-info.json 재작성 + stderr 경고 1줄 후 fresh 값으로 계속 진행, lock 경합/probe 실패 시 fail-closed `INFRA_NOT_READY`(2026-07-19 개정, 상세는 §R6 #3.3; APFS synthetic st_dev 재부팅 churn 대응). remediation은 `eghs-init --repair`. guard rwlock과 admin-mutex 정확성은 flock 지원에 종속되므로 미지원 FS는 지원 밖.
     7. `schema_version`을 R2.5 atomic write로 작성(**strict 형식 `^[1-9][0-9]*\n$` 최대 32바이트**; 코드 버전 ≥ 1). `0\n`이나 선행 0(`01\n`) 금지 — precedence #1 reader와 동일 규칙. **반드시 5/6단계 완료 후에 schema_version을 마지막으로 작성**(schema 존재 = 모든 인프라 준비 완료의 단일 signal).
     8. probe 파일, `.init.lock`, `migrate.lock` 순서로 삭제. **admin-mutex 해제**.
