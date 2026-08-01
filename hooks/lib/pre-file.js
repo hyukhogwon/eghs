@@ -131,6 +131,27 @@ function gcPreFiles(stateDir, { nowMs }) {
         }
       }
     }
+
+    // The sid dir itself outlives its files: emptying it above (or a cascade
+    // that only removed files) used to leave a permanent husk — observed live
+    // as a month-old empty pre/<sid>/ with nothing but tmp/ inside (§G5).
+    // rmdir only (never recursive), and only when the dir has been untouched
+    // for the same 24h: a live sid between writePreFile's mkdir and its open
+    // has a fresh dir mtime, so this can never yank a directory out from
+    // under an in-flight write.
+    const sidDir = path.join(preRoot, sid);
+    try {
+      if (nowMs - fs.statSync(sidDir).mtimeMs <= PRE_FILE_MAX_AGE_MS) continue;
+    } catch {
+      continue; // vanished mid-pass
+    }
+    for (const dir of [path.join(sidDir, 'tmp'), sidDir]) {
+      try {
+        fs.rmdirSync(dir);
+      } catch {
+        // absent or non-empty: leave it for a later pass
+      }
+    }
   }
 }
 

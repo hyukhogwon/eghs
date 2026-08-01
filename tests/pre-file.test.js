@@ -139,3 +139,35 @@ test('gcPreFiles tolerates a missing pre/ directory', () => {
   const bare = fs.mkdtempSync(path.join(os.tmpdir(), 'eghs-pre-bare-'));
   assert.doesNotThrow(() => gcPreFiles(bare, { nowMs: Date.now() }));
 });
+
+// ---- P4 finale: empty sid dirs must not outlive their files (§G5) ----
+
+test('gcPreFiles rmdirs an empty pre/<sid>/ (and its tmp/) once both are 24h stale', () => {
+  const stateDir = mkStateDir();
+  const sidDir = path.join(stateDir, 'pre', SID);
+  fs.mkdirSync(path.join(sidDir, 'tmp'), { recursive: true });
+  const old = Date.now() / 1000 - 48 * 3600;
+  fs.utimesSync(path.join(sidDir, 'tmp'), old, old);
+  fs.utimesSync(sidDir, old, old);
+  gcPreFiles(stateDir, { nowMs: Date.now() });
+  assert.ok(!fs.existsSync(sidDir));
+});
+
+test('gcPreFiles keeps a freshly-touched empty sid dir (live-session write window)', () => {
+  const stateDir = mkStateDir();
+  const sidDir = path.join(stateDir, 'pre', SID);
+  fs.mkdirSync(path.join(sidDir, 'tmp'), { recursive: true });
+  gcPreFiles(stateDir, { nowMs: Date.now() });
+  assert.ok(fs.existsSync(sidDir), 'a dir touched moments ago may be mid-write');
+});
+
+test('gcPreFiles never removes a sid dir that still holds a fresh record', () => {
+  const stateDir = mkStateDir();
+  const sidDir = path.join(stateDir, 'pre', SID);
+  fs.mkdirSync(sidDir, { recursive: true });
+  fs.writeFileSync(path.join(sidDir, 'aa.toolu_X.write.json'), '{}');
+  const old = Date.now() / 1000 - 48 * 3600;
+  fs.utimesSync(sidDir, old, old);
+  gcPreFiles(stateDir, { nowMs: Date.now() });
+  assert.ok(fs.existsSync(path.join(sidDir, 'aa.toolu_X.write.json')));
+});
