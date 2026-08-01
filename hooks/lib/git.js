@@ -37,17 +37,33 @@ function getHeadCommit(repoRoot) {
 // says "Could not access 'HEAD'", `git rev-parse` says "not a git
 // repository"), so this checks repo-ness explicitly via getRepoRoot instead
 // of pattern-matching stderr.
+function hasCommits(repoRoot) {
+  try {
+    git(['rev-parse', '--verify', 'HEAD'], repoRoot);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function getChangedFiles(repoRoot, diffBase) {
   if (getRepoRoot(repoRoot) === null) {
     return [];
   }
 
-  let tracked;
-  try {
-    const out = git(['diff', '--name-only', diffBase, '--', '.'], repoRoot);
-    tracked = out ? out.split('\n').filter(Boolean) : [];
-  } catch (err) {
-    throw new Error(`[eghs] git diff --name-only ${diffBase} failed: ${err.message}`);
+  let tracked = [];
+  // A repo with zero commits has no resolvable diff base at all (the session
+  // baseline records NO_GIT, and `git diff HEAD` fails with "ambiguous
+  // argument"). Every file is new by definition, so report untracked only
+  // instead of throwing INFRA_NOT_READY at the user — verification still runs
+  // unless the untracked set is entirely skip-globbed.
+  if (hasCommits(repoRoot)) {
+    try {
+      const out = git(['diff', '--name-only', diffBase, '--', '.'], repoRoot);
+      tracked = out ? out.split('\n').filter(Boolean) : [];
+    } catch (err) {
+      throw new Error(`[eghs] git diff --name-only ${diffBase} failed: ${err.message}`);
+    }
   }
 
   let untracked = [];

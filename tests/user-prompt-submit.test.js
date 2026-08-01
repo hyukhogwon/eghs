@@ -154,3 +154,36 @@ test('EPIPE on stdout (reader gone) still exits 0 (fail-soft)', async () => {
   const code = await new Promise((resolve) => child.on('close', resolve));
   assert.equal(code, 0);
 });
+
+// ---- P4 unit 14: carried item 3 (CLAUDE_PROJECT_DIR unset → cwd fallback) ----
+
+test('falls back to cwd when CLAUDE_PROJECT_DIR is unset', () => {
+  const repo = mkRepo();
+  initRepo(repo);
+  const env = { ...process.env, CI: '', GITHUB_ACTIONS: '', GITLAB_CI: '', BUILDKITE: '', EGHS_DISABLED: '' };
+  delete env.CLAUDE_PROJECT_DIR;
+  const res = spawnSync('node', [HOOK], {
+    input: JSON.stringify({ session_id: SID, user_input: 'hi' }),
+    encoding: 'utf8',
+    cwd: repo,
+    env,
+  });
+  assert.equal(res.status, 0);
+  assert.match(JSON.parse(res.stdout).hookSpecificOutput.additionalContext, /Read it first/);
+});
+
+test('an unset CLAUDE_PROJECT_DIR still honors the cwd repo kill switch', () => {
+  const repo = mkRepo();
+  initRepo(repo);
+  fs.writeFileSync(path.join(repo, '.claude', 'eghs-off'), '');
+  const env = { ...process.env, CI: '', GITHUB_ACTIONS: '', GITLAB_CI: '', BUILDKITE: '', EGHS_DISABLED: '' };
+  delete env.CLAUDE_PROJECT_DIR;
+  const res = spawnSync('node', [HOOK], {
+    input: JSON.stringify({ session_id: SID }),
+    encoding: 'utf8',
+    cwd: repo,
+    env,
+  });
+  assert.equal(res.status, 0);
+  assert.equal(res.stdout, '');
+});

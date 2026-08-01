@@ -91,3 +91,30 @@ test('shouldSkipVerification is false when any changed file does not match', () 
 test('shouldSkipVerification is false when there are no changed files and no globs configured', () => {
   assert.equal(shouldSkipVerification([], []), false);
 });
+
+// ---- P4 unit 14: carried item 2 (zero-commit repo edge) ----
+
+function mkEmptyGitRepo() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'eghs-git-empty-'));
+  sh('git', ['init', '-q'], dir);
+  sh('git', ['config', 'user.email', 'a@b.c'], dir);
+  sh('git', ['config', 'user.name', 'eghs-test'], dir);
+  return dir;
+}
+
+test('getChangedFiles reports untracked files in a repo with zero commits instead of throwing', () => {
+  const dir = mkEmptyGitRepo();
+  fs.writeFileSync(path.join(dir, 'a.ts'), 'export {};\n');
+  assert.deepEqual(getChangedFiles(dir, 'NO_GIT'), ['a.ts']);
+});
+
+test('getChangedFiles still throws on a bad diff base once the repo HAS commits', () => {
+  const dir = mkGitRepo();
+  assert.throws(() => getChangedFiles(dir, 'nonexistent-ref-xyz'), /git diff --name-only/);
+});
+
+test('a zero-commit repo does not skip verification (untracked file outside the skip globs)', () => {
+  const dir = mkEmptyGitRepo();
+  fs.writeFileSync(path.join(dir, 'a.ts'), 'export {};\n');
+  assert.equal(shouldSkipVerification(getChangedFiles(dir, 'NO_GIT'), ['**/*.md']), false);
+});

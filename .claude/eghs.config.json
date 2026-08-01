@@ -1,0 +1,3 @@
+{
+  "state_gate_paths": ["hooks/**/*.js"]
+}
