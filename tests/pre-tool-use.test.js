@@ -238,3 +238,65 @@ test('gate ON, new-file Write on a gated path is allowed (pre_sha null, R4 handl
   assert.equal(recs.length, 1);
   assert.equal(recs[0].pre_sha, null);
 });
+
+// ---- P5 unit 1: gate_applicable fidelity in the §5 measurement log ----
+
+function debugEvents(repo) {
+  const p = path.join(repo, '.claude', 'state', 'eghs', 'debug', `${SID}.jsonl`);
+  if (!fs.existsSync(p)) return [];
+  return fs
+    .readFileSync(p, 'utf8')
+    .split('\n')
+    .filter((l) => l.trim() !== '')
+    .map((l) => JSON.parse(l));
+}
+
+// PRD §R3: a path is gate-applicable when it matches state_gate_paths AND the
+// file exists. A new-file Write is explicitly "신규 파일 Write 후보" handed to
+// R4 — logging it as applicable would park it in the Evidence-bearing Edit
+// ratio denominator with has_gate_passing_state:false forever.
+test('gate ON, new-file Write logs gate_applicable:false (PRD §R3 applicability)', () => {
+  const repo = mkRepo();
+  writeConfig(repo, ['**/*.ts']);
+  const file = path.join(repo, 'fresh.ts');
+  runHook(repo, toolInput('Write', file));
+  const events = debugEvents(repo).filter((e) => e.hook === 'PreToolUse');
+  assert.equal(events.length, 1);
+  assert.equal(events[0].decision, 'allow');
+  assert.equal(events[0].gate_applicable, false);
+  assert.equal(events[0].has_gate_passing_state, false);
+});
+
+test('gate ON, allowed Edit on an existing gated file logs gate_applicable:true + passing state', () => {
+  const repo = mkRepo();
+  writeConfig(repo, ['**/*.ts']);
+  const file = path.join(repo, 'src.ts');
+  fs.writeFileSync(file, 'code');
+  runHook(repo, toolInput('Read', file));
+  const POST = path.join(__dirname, '..', 'hooks', 'post-tool-use.js');
+  spawnSync('node', [POST], {
+    cwd: repo,
+    input: JSON.stringify({ ...toolInput('Read', file), tool_response: { type: 'text', file: {} } }),
+    encoding: 'utf8',
+    env: process.env,
+  });
+  runHook(repo, toolInput('Edit', file));
+  const allow = debugEvents(repo).filter((e) => e.hook === 'PreToolUse' && e.tool === 'Edit');
+  assert.equal(allow.length, 1);
+  assert.equal(allow[0].gate_applicable, true);
+  assert.equal(allow[0].has_gate_passing_state, true);
+  assert.equal(allow[0].evidence_kind, 'full_read');
+});
+
+test('gate ON, denied Edit still logs gate_applicable:true', () => {
+  const repo = mkRepo();
+  writeConfig(repo, ['**/*.ts']);
+  const file = path.join(repo, 'src.ts');
+  fs.writeFileSync(file, 'code');
+  runHook(repo, toolInput('Edit', file));
+  const events = debugEvents(repo).filter((e) => e.hook === 'PreToolUse');
+  assert.equal(events.length, 1);
+  assert.equal(events[0].decision, 'block');
+  assert.equal(events[0].gate_applicable, true);
+  assert.equal(events[0].deny_code, 'UNREAD_OR_STALE');
+});

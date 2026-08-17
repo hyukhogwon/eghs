@@ -61,7 +61,11 @@ function handleWriteGate(ctx, input, nowMs, toolUseId) {
     logPre(ctx, input, nowMs, {
       decision: 'allow',
       path: gate.key,
-      gateApplicable: true,
+      // PRD §R3: applicable = matches state_gate_paths AND exists on disk. A
+      // new-file Write is a §R4 case, not a gate case — logging it applicable
+      // would sit in the Evidence-bearing Edit ratio denominator forever with
+      // has_gate_passing_state:false and depress the §5 metric permanently.
+      gateApplicable: !gate.newFile,
       hasGatePassingState: gate.preSha !== null,
       evidenceKind: gate.evidence || null, // null on the new-file Write row
     });
