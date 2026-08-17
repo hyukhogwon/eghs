@@ -144,6 +144,13 @@ node hooks/bypass-watcher.js --interval-seconds 30
 `bypass_detection_rate` stays `n/a` until the watcher has produced observations AND a later
 Write/Edit touched the same path — run the watcher before/after a shell edit to exercise it.
 
+**P5 exit criteria are NOT yet demonstrated on live data** — the mechanism is in place and
+verified end-to-end in a throwaway repo (Read → `sed` → Edit → `RACE_DETECTED`, 1/1), but this
+repo's watcher only has its first baseline (81 watched files). `kill switch < 주 1회` is
+unmeasurable by construction (see above). `evidence-bearing Edit ratio` currently reads
+85.0% (17/20) here, under the 0.9 target — all three denies are legitimate `partial_read`
+evidence on newly-gated `tests/` files, and n is tiny. Recheck once the sample grows.
+
 ## Verification Quick Reference
 
 ```bash
