@@ -210,7 +210,17 @@ function main(argv) {
   runOnce();
   if (opts.once) return;
 
-  const timer = setInterval(runOnce, opts.intervalSeconds * 1000);
+  // In daemon mode a poll must not be able to kill the watcher: a config file
+  // saved mid-edit, a transient EACCES, a full disk — all recover on the next
+  // tick, and a watcher that exited hours ago silently stops measuring. The
+  // one-shot path above deliberately keeps throwing (exit 1).
+  const timer = setInterval(() => {
+    try {
+      runOnce();
+    } catch (err) {
+      process.stderr.write(`[eghs] bypass-watcher: poll failed, retrying next tick: ${err.message}\n`);
+    }
+  }, opts.intervalSeconds * 1000);
   const stop = () => {
     clearInterval(timer);
     process.exit(0);

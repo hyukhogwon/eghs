@@ -5,7 +5,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { execFileSync, spawnSync } = require('child_process');
+const { execFileSync, spawn, spawnSync } = require('child_process');
 
 const WATCHER = path.join(__dirname, '..', 'hooks', 'bypass-watcher.js');
 const INIT_SCRIPT = path.join(__dirname, '..', 'hooks', 'init.js');
@@ -216,4 +216,59 @@ test('the EGHS state dir and .git are never walked', () => {
   run(repo);
   const paths = observations(repo).map((o) => o.path);
   assert.equal(paths.some((p) => p.includes(path.join('state', 'eghs'))), false);
+});
+
+// One-shot must fail loudly; a daemon that is meant to run for hours must not
+// be killed by a single bad poll (a config saved mid-edit, a transient EACCES).
+test('a broken config aborts --once', () => {
+  const repo = mkRepo();
+  fs.writeFileSync(path.join(repo, 'a.ts'), 'one');
+  fs.writeFileSync(path.join(repo, '.claude', 'eghs.config.json'), '{not json');
+  const { exitCode, stderr } = run(repo);
+  assert.equal(exitCode, 1);
+  assert.match(stderr, /eghs\.config\.json/);
+});
+
+test('in daemon mode a failing poll is logged and the watcher keeps running', async () => {
+  const repo = mkRepo();
+  fs.writeFileSync(path.join(repo, 'a.ts'), 'one');
+  const child = spawn('node', [WATCHER, '--interval-seconds', '1'], { cwd: repo, encoding: 'utf8' });
+  let stderr = '';
+  child.stderr.setEncoding('utf8');
+
+  try {
+    // Break the config only AFTER the first poll succeeded, so the failure
+    // lands on a subsequent tick rather than on startup.
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error(`watcher never polled: ${stderr}`)), 10000);
+      child.stderr.on('data', (chunk) => {
+        stderr += chunk;
+        if (stderr.includes('baseline recorded')) {
+          clearTimeout(timeout);
+          resolve();
+        }
+      });
+      child.on('exit', (code) => reject(new Error(`watcher exited early (${code}): ${stderr}`)));
+    });
+
+    fs.writeFileSync(path.join(repo, '.claude', 'eghs.config.json'), '{not json');
+
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error(`no retry line: ${stderr}`)), 10000);
+      const check = () => {
+        if (stderr.includes('retrying next tick')) {
+          clearTimeout(timeout);
+          resolve();
+        }
+      };
+      child.stderr.on('data', check);
+      child.on('exit', (code) => reject(new Error(`watcher died on a bad poll (${code}): ${stderr}`)));
+      check();
+    });
+
+    assert.equal(child.exitCode, null, 'watcher should still be running');
+  } finally {
+    child.removeAllListeners('exit');
+    child.kill('SIGKILL');
+  }
 });

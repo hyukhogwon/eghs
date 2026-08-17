@@ -12,10 +12,10 @@ Evidence-Gated Hook System for Claude Code. Rollout per PRD §6 — **all five p
 | P2 | UserPromptSubmit — fail-soft prompt-discipline injection | **DONE** (reviewed, +17 tests) |
 | P3 | Pre/PostToolUse Read/Edit state writer — gate off, records only | **DONE** (reviewed per unit, +102 tests) |
 | P4 | Edit state-gate on core source paths | **DONE** (units 1-14 + finale, +210 tests) |
-| P5 | matcher expansion to source/config + measurement CLIs | **DONE** (units 1-4, +40 tests) |
+| P5 | matcher expansion to source/config + measurement CLIs | **DONE** (units 1-4, +42 tests) |
 
 - Branch: `main`, pushed to https://github.com/hyukhogwon/eghs (public). Everything after P2 is local-only until the user asks for a push.
-- Suite: **467/467** via `npm test`. Do NOT use `node --test tests/` (bare directory form) — broken on Node v24; single-file `node --test tests/<file>.js` works.
+- Suite: **469/469** via `npm test`. Do NOT use `node --test tests/` (bare directory form) — broken on Node v24; single-file `node --test tests/<file>.js` works.
 - **The R3 gate is LIVE in this repo, now over source AND config**: `.claude/eghs.config.json` sets
   `state_gate_paths: ["hooks/**/*.js", "tests/**/*.js", "package.json", ".claude/*.json"]`, so editing any of
   those without a same-session `full_read`/`post_edit_success` record is denied (exit 2). Read the file
@@ -147,7 +147,7 @@ Write/Edit touched the same path — run the watcher before/after a shell edit t
 ## Verification Quick Reference
 
 ```bash
-npm test                                   # full suite, expect 467 passing
+npm test                                   # full suite, expect 469 passing
 printf '{"session_id":"11111111-1111-4111-8111-111111111111"}' \
   | node hooks/stop.js; echo " exit=$?"    # Stop smoke (this repo: exit 0, EMPTY stdout when clean)
 printf '{}' | node hooks/user-prompt-submit.js; echo " exit=$?"  # UPS smoke: principles JSON + exit 0
