@@ -71,6 +71,13 @@ function inWindow(row, sinceMs) {
 // changed. An observation with no follow-up at all is `undetermined`: an edit
 // that never happened cannot be denied, so counting it as a miss would report
 // the gate as failing when it was simply never asked.
+//
+// `blocked_other` is a P5 addition the first end-to-end smoke forced. A bypass
+// on a file this session never read denies with UNREAD_OR_STALE, not
+// RACE_DETECTED — the edit IS blocked, but not by race detection, so §5's
+// literal rate must not count it while the report must not imply it escaped.
+// The headline rate stays exactly as §5 defines it; the breakdown carries the
+// rest.
 function bypassDetection(bypassRows, hookRows) {
   const byPath = new Map();
   for (const row of hookRows) {
@@ -82,19 +89,22 @@ function bypassDetection(bypassRows, hookRows) {
   for (const rows of byPath.values()) rows.sort((a, b) => a.ts_ms - b.ts_ms);
 
   let detected = 0;
+  let blockedOther = 0;
   let missed = 0;
   let undetermined = 0;
   for (const obs of bypassRows) {
     if (obs.event !== 'bypass_observed') continue;
     const followUp = (byPath.get(obs.path) || []).find((r) => r.ts_ms > obs.ts_ms);
     if (!followUp) undetermined += 1;
-    else if (followUp.decision === 'block' && followUp.deny_code === 'RACE_DETECTED') detected += 1;
-    else missed += 1;
+    else if (followUp.decision !== 'block') missed += 1;
+    else if (followUp.deny_code === 'RACE_DETECTED') detected += 1;
+    else blockedOther += 1;
   }
-  const decided = detected + missed;
+  const decided = detected + blockedOther + missed;
   return {
     value: decided === 0 ? null : detected / decided,
     detected,
+    blocked_other: blockedOther,
     missed,
     undetermined,
   };

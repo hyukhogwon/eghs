@@ -75,8 +75,10 @@ function render(m, killSwitchState) {
     `bypass_detection_rate         ${
       bypass.value === null
         ? `n/a (no decided observations)`
-        : `${(bypass.value * 100).toFixed(1)}%  (${bypass.detected}/${bypass.detected + bypass.missed})`
+        : `${(bypass.value * 100).toFixed(1)}%  (${bypass.detected}/${bypass.detected + bypass.blocked_other + bypass.missed})`
     }          target > 0.9`,
+    `                              blocked by another deny_code: ${bypass.blocked_other} (edit stopped, just not by race detection)`,
+    `                              escaped (edit allowed): ${bypass.missed}`,
     `                              undetermined: ${bypass.undetermined} (observed, never followed by an edit)`,
     `stop_verification_pass_rate   ${formatRatio(m.stop_verification_pass_rate)}          target > 0.95`,
     `stop_latency_ms               p50=${m.stop_latency_ms.p50 ?? 'n/a'} p95=${m.stop_latency_ms.p95 ?? 'n/a'} (n=${m.stop_latency_ms.n})   target p50<60000 p95<90000`,

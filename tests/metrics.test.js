@@ -225,6 +225,22 @@ test('a bypass followed by an allowed edit counts as missed', () => {
   assert.equal(m.bypass_detection_rate.value, 0);
 });
 
+// A bypass on a file the session never read denies with UNREAD_OR_STALE. §5's
+// rate is defined over RACE_DETECTED, so this is not "detected" — but the edit
+// was still stopped, and reporting it as an escape would be a lie.
+test('a bypass blocked by a different deny_code is neither detected nor an escape', () => {
+  const dir = mkStateDir();
+  writeBypassLog(dir, [{ ts_ms: 1000, path: '/repo/a.ts' }]);
+  writeLog(dir, SID_A, [
+    ev({ ts_ms: 2000, path: '/repo/a.ts', gate_applicable: true, decision: 'block', deny_code: 'UNREAD_OR_STALE' }),
+  ]);
+  const m = computeMetrics(dir, {});
+  assert.equal(m.bypass_detection_rate.detected, 0);
+  assert.equal(m.bypass_detection_rate.blocked_other, 1);
+  assert.equal(m.bypass_detection_rate.missed, 0);
+  assert.equal(m.bypass_detection_rate.value, 0); // in the denominator, per §5
+});
+
 test('only the EARLIEST subsequent write event on that path decides the outcome', () => {
   const dir = mkStateDir();
   writeBypassLog(dir, [{ ts_ms: 1000, path: '/repo/a.ts' }]);
