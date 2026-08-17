@@ -884,9 +884,11 @@ Auto-unblock 금지(R3 enum의 `Auto-unblock: No`):
 | False-deny rate             | 사람이 잘못된 deny로 라벨링한 비율                                                                  | < 5%   | No (post-MVP `eghs-label` 도입 후) |
 | Stop verification pass rate | self-correction 포함 최종 Stop 통과 비율 (kill_switch 이벤트 제외)                                  | > 95%  | Yes |
 | Stop latency p50/p95        | Stop hook wall time                                                                            | p50 < 60s, p95 < 90s | Yes |
-| Kill switch usage           | 주당 kill switch 발동 횟수                                                                              | < 1회   | Yes |
+| Kill switch usage           | 주당 kill switch 발동 횟수                                                                              | < 1회   | ~~Yes~~ → **No** (2026-08-17 개정, 아래) |
 
 `Gate enforcement rate`는 hook 코드 자체의 invariant(allow ⇒ evidence 있음)이므로 unit test로 보장하며, runtime metric에서는 제거.
+
+**개정 (2026-08-17, P5)**: `Kill switch usage`의 `MVP measurable`은 **No**로 정정한다. §R6 #2는 kill switch가 active일 때 stderr 1줄 외 **어떤 disk write도 금지**하며, 이 no-write 규칙이 G5("즉시 비활성화 가능")와 "kill switch 환경에서 disk leak 없음" 보장의 단일 근거다. 따라서 kill switch 발동은 `debug/<sid>.jsonl`에 기록될 수 없고(기록하는 순간 invariant 위반), 이벤트 schema의 `kill_switch` 필드는 실제로는 항상 `off`이며 `decision: "kill_switch"` 행 역시 hook에서 생성되지 않는다. 발동 횟수는 hook telemetry가 아니라 운영자(human)가 out-of-band로 센다 — kill switch는 §3 non-goal에 따라 human intent 전용이기 때문이다. `eghs-metrics`는 셀 수 없는 횟수 대신 **현재 kill switch 상태**(`off|file|env|ci`)를 보고한다. 같은 성격의 선례: `False-deny rate`(not-measured).
 
 **측정 방법**:
 
@@ -912,10 +914,16 @@ Auto-unblock 금지(R3 enum의 `Auto-unblock: No`):
 ```
 
 * `has_gate_passing_state`는 R3 gate 통과 조건을 만족하는 evidence(`full_read` 또는 `post_edit_success`) 보유 여부. `evidence_kind`는 구체적 종류(metric 세분화용).
+* **`gate_applicable`은 §R3의 gate 적용 대상 판정과 정확히 일치한다** — `state_gate_paths` 매칭 **AND 디스크에 파일 존재**. 신규 파일 Write(§R3 "파일이 존재하지 않으면 신규 파일 Write 후보")는 `gate_applicable: false`로 기록한다. (2026-08-17 P5 명문화: `true`로 기록하면 신규 파일이 `has_gate_passing_state: false`인 채 Evidence-bearing Edit ratio 분모에 영구히 남아 metric을 왜곡한다.)
 * `Evidence-bearing Edit ratio`/`Gate deny ratio`는 위 schema의 필드만으로 계산 가능.
 * `Bash-bypass detection rate`: 일정 주기로 watched paths의 SHA를 polling해 변경을 감지한 직후의 Edit gate 결과를 측정. polling은 별도 background script(`eghs-bypass-watcher`)로 옵션 제공.
+    * (2026-08-17 P5) 관측 로그는 `debug/bypass-watcher.jsonl`(1줄 1 `bypass_observed` 이벤트: `ts_ms`/`path`(canonical key)/`prev_sha`/`new_sha`), 직전 poll 스냅샷은 `debug/.bypass-snapshot.json`. 기존 subdir만 사용하므로 §R2.5 레이아웃 변경도 `schema_version` bump도 없다. `debug/` GC는 sid 단위(`debug/<sid>.jsonl`)라 이 두 파일에 닿지 않으므로 watcher가 스스로 로그를 rotate한다(§G5).
+    * **attribution**: 변경된 파일의 `reads/<sha1(key)>.json`이 **새 sha**를 `evidence: post_edit_success`로 담고 있으면 EGHS가 관측한 편집이므로 bypass가 아니다. `full_read`는 attribution이 되지 않는다(읽기는 파일을 바꾸지 않는다).
+    * **생성/삭제는 관측 대상이 아니다**: EGHS가 본 적 없는 신규 파일에 대한 후속 Edit은 `UNREAD_OR_STALE`로 deny되지 `RACE_DETECTED`가 아니므로 본 metric의 정의 범위 밖이다(스냅샷에만 반영).
+    * **분류**: 관측 직후 같은 path의 **가장 이른** PreToolUse Write/Edit/MultiEdit 결정을 본다. `block`+`RACE_DETECTED` = detected, 다른 deny_code의 `block` = `blocked_other`(편집은 막혔으나 race 탐지는 아님), `allow` = missed, 후속 호출 자체가 없으면 `undetermined`(분모 제외 — 일어나지 않은 Edit은 deny될 수 없다). 비율 = `detected / (detected + blocked_other + missed)`로 §5 정의(`RACE_DETECTED`로 deny된 비율)를 그대로 유지하되, `blocked_other`를 별도 보고해 "막혔는데 놓친 것으로 읽히는" 오독을 막는다.
 * `Stop verification pass rate` = `count(Stop, decision=allow, kill_switch=off) / count(Stop, kill_switch=off)`.
 * False-deny rate는 `eghs-label` CLI(post-MVP)로 사람이 deny 이벤트에 `false_positive: bool` annotation을 추가. **MVP에서는 not-measured로 명시**.
+* (2026-08-17 P5) 위 metric들의 실제 계산은 `eghs-metrics` CLI(`node hooks/metrics.js`)가 수행한다 — `debug/` 로그만 읽는 read-only 도구이며 lock도 sid도 요구하지 않는다. 분모가 0인 비율은 `0`이 아니라 `null`로 보고한다("데이터 없음"과 "하나도 통과 못함"은 §6 exit criteria에서 다른 판정이다).
 
 ---
 
@@ -930,6 +938,10 @@ Auto-unblock 금지(R3 enum의 `Auto-unblock: No`):
 | P5    | matcher 확장               | source/config 전체    | Bash-bypass detection > 90%, kill switch < 주 1회  |
 
 **P3 검증 도구**: `eghs-inspect` CLI(또는 `node hooks/inspect.js`)로 현재 state dir 내용을 dump하고 dry-run hook input을 stdin으로 받아 결정을 출력한다(MVP item 7).
+
+**P5 "matcher 확장"의 범위 (2026-08-17 확정)**: 여기서 matcher는 **`state_gate_paths` glob matcher**를 가리키며, Claude Code hook 등록의 `matcher` 필드(`Read|Write|Edit|MultiEdit`)가 아니다. 위 표의 Scope 열은 모든 행에서 *경로* 범위이고(P4 "핵심 source path만" → P5 "source/config 전체"), tool 추가(NotebookEdit/Bash)는 §R3 스펙 변경이며 Bash 직접 차단은 §3 non-goal이다. P5는 gate 대상 경로를 저장소의 source+config 전면으로 넓히고, 위 exit criteria를 **측정 가능하게** 만드는 단계다(`eghs-metrics` + `eghs-bypass-watcher`, §5 참조). docs(`*.md`)는 source도 config도 아니므로 대상 밖.
+
+**P5 검증 도구**: `eghs-metrics` CLI(`node hooks/metrics.js`)가 §5 metric 표를 계산하고, `eghs-bypass-watcher`(`node hooks/bypass-watcher.js`)가 Bash-bypass 관측을 공급한다.
 
 ---
 

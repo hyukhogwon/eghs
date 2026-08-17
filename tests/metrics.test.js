@@ -303,6 +303,16 @@ test('sinceMs also filters bypass observations', () => {
 
 // ---- CLI ----
 
+test('CLI --sid rejects anything that is not a UUIDv4 (it becomes a filename)', () => {
+  const dir = mkStateDir();
+  writeLog(dir, SID_A, [ev({})]);
+  const ok = spawnSync('node', [CLI, '--json', '--state-dir', dir, '--sid', SID_A], { encoding: 'utf8' });
+  assert.equal(ok.status, 0);
+  const bad = spawnSync('node', [CLI, '--state-dir', dir, '--sid', '../../etc/passwd'], { encoding: 'utf8' });
+  assert.equal(bad.status, 1);
+  assert.match(bad.stderr, /--sid/);
+});
+
 test('CLI --json prints the metric object and exits 0', () => {
   const dir = mkStateDir();
   writeLog(dir, SID_A, [ev({ gate_applicable: true, has_gate_passing_state: true })]);

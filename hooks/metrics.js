@@ -12,6 +12,7 @@ const { resolveStateDir } = require('./lib/state-dir');
 const { computeMetrics } = require('./lib/metrics');
 const { checkKillSwitch } = require('./lib/kill-switch');
 const { isCI } = require('./lib/ci');
+const { isValidSid } = require('./lib/sid');
 
 const RELATIVE_SINCE = /^(\d+)([dhm])$/;
 const UNIT_MS = { d: 86400000, h: 3600000, m: 60000 };
@@ -37,7 +38,12 @@ function parseArgs(argv, nowMs) {
       return v;
     };
     if (arg === '--json') opts.json = true;
-    else if (arg === '--sid') opts.sid = next();
+    else if (arg === '--sid') {
+      // The sid becomes a filename under debug/ — validate it the way the
+      // hooks do rather than letting `--sid ../../x` pick the file to read.
+      opts.sid = next();
+      if (!isValidSid(opts.sid)) throw new Error(`--sid expects a UUIDv4, got "${opts.sid}"`);
+    }
     else if (arg === '--since') opts.sinceMs = parseSince(next(), nowMs);
     else if (arg === '--state-dir') opts.stateDir = next();
     else throw new Error(`unknown argument: ${arg}`);

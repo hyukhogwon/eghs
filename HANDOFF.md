@@ -2,9 +2,9 @@
 
 Agent-facing handoff for the next session. Human-facing overview lives in `README.md`; full spec in `PRD.md`.
 
-## Project State (as of 2026-08-01)
+## Project State (as of 2026-08-17)
 
-Evidence-Gated Hook System for Claude Code. Rollout per PRD §6:
+Evidence-Gated Hook System for Claude Code. Rollout per PRD §6 — **all five phases done**:
 
 | Phase | Scope | Status |
 |-------|-------|--------|
@@ -12,18 +12,27 @@ Evidence-Gated Hook System for Claude Code. Rollout per PRD §6:
 | P2 | UserPromptSubmit — fail-soft prompt-discipline injection | **DONE** (reviewed, +17 tests) |
 | P3 | Pre/PostToolUse Read/Edit state writer — gate off, records only | **DONE** (reviewed per unit, +102 tests) |
 | P4 | Edit state-gate on core source paths | **DONE** (units 1-14 + finale, +210 tests) |
+| P5 | matcher expansion to source/config + measurement CLIs | **DONE** (units 1-4, +40 tests) |
 
 - Branch: `main`, pushed to https://github.com/hyukhogwon/eghs (public). Everything after P2 is local-only until the user asks for a push.
-- Suite: **427/427** via `npm test`. Do NOT use `node --test tests/` (bare directory form) — broken on Node v24; single-file `node --test tests/<file>.js` works.
-- **The R3 gate is LIVE in this repo**: `.claude/eghs.config.json` sets `state_gate_paths: ["hooks/**/*.js"]`, so editing a hook file without a same-session `full_read`/`post_edit_success` record is denied (exit 2). Read the file first, or use the kill switch below.
+- Suite: **467/467** via `npm test`. Do NOT use `node --test tests/` (bare directory form) — broken on Node v24; single-file `node --test tests/<file>.js` works.
+- **The R3 gate is LIVE in this repo, now over source AND config**: `.claude/eghs.config.json` sets
+  `state_gate_paths: ["hooks/**/*.js", "tests/**/*.js", "package.json", ".claude/*.json"]`, so editing any of
+  those without a same-session `full_read`/`post_edit_success` record is denied (exit 2). Read the file
+  first, or use the kill switch below. Docs (`*.md`) are deliberately NOT gated — neither source nor config.
 - All hooks (Stop, UserPromptSubmit, PreToolUse + PostToolUse with matcher `Read|Write|Edit|MultiEdit`) are registered in `.claude/settings.json` and live in this repo's own Claude Code sessions (dogfooding).
 
-## Process Conventions (established across P1/P2, kept through P4)
+## Process Conventions (established across P1/P2, kept through P5)
 
 1. brainstorm → design spec (`docs/superpowers/specs/`) → implementation plan (`docs/superpowers/plans/`) → subagent-driven execution (fresh implementer per task + task review) → final checkpoint: senior whole-branch review **+ Codex review**, fix all Critical/Major, re-review.
 2. TDD per task; commit per task; Conventional Commits; work directly on `main`; never push without explicit user request.
 3. Plan code blocks are verbatim — implementers transcribe, they don't improvise.
 4. Session scratch/ledger in `.superpowers/sdd/` (self-gitignored).
+
+Deviation to know about: the P4 finale and all of P5 ran **without subagents** — those sessions'
+system prompts forbade spawning them unless the user asked. Reviews were whole-branch self-review
+passes instead. The senior + Codex whole-branch review in convention 1 is therefore still OPEN for
+P4 and P5 if the user wants it.
 
 ## Key Design Decisions (do not re-litigate)
 
@@ -53,10 +62,43 @@ Evidence-Gated Hook System for Claude Code. Rollout per PRD §6:
 2. **Zero-commit git repo edge** — closed: `getChangedFiles` detects a repo with no commits and reports untracked files only, so Stop runs verification instead of failing `INFRA_NOT_READY`.
 3. **`CLAUDE_PROJECT_DIR` unset → cwd fallback** — closed: two regression tests in `tests/user-prompt-submit.test.js`. (Tests still leave `mkdtemp` dirs; OS-reaped, matches suite convention.)
 
-## Deferred: Codex CLI Port (comes AFTER P4)
+## P5 Design Decisions (do not re-litigate)
+
+- **"matcher 확장" is the `state_gate_paths` glob matcher, not the Claude Code hook `matcher` field.**
+  §6's Scope column is a *path* scope on every row; adding tools (NotebookEdit/Bash) would be an §R3
+  spec change, and §3 lists direct Bash blocking as a non-goal. PRD §6 amended to say so.
+- **`gate_applicable` is false for new-file Writes.** §R3 defines applicability as "matches
+  `state_gate_paths` AND exists on disk". The old `true` parked every new file in the Evidence-bearing
+  Edit ratio denominator with `has_gate_passing_state:false` — permanently depressing the exact metric
+  P4/P5 gate on. PRD §5 event-schema note amended.
+- **Kill switch usage is NOT measurable** and the PRD said otherwise. §R6 #2 forbids any disk write once
+  the switch is active, and that no-write rule is the single basis for G5 — so it outranks the metric.
+  `eghs-metrics` reports the *current* kill-switch state instead; the count is an operator's out-of-band
+  observation (kill switch is human-intent-only per §3). PRD §5 amended, same resolution as False-deny rate.
+- **Zero-denominator ratios report `null`, never `0`.** "No data" and "nothing passed" are different
+  answers and §6's exit criteria act on them differently.
+- **Bypass outcomes are four-way, not two-way**: `detected` (block + RACE_DETECTED), `blocked_other`
+  (block with a different deny_code — the edit WAS stopped, just not by race detection), `missed`
+  (allowed through), `undetermined` (no follow-up edit; excluded from the denominator — an edit that
+  never happened cannot be denied). Forced by the first end-to-end smoke: a bypass on a file the session
+  never read denies `UNREAD_OR_STALE`. The headline rate keeps §5's literal definition; the breakdown
+  stops a block from reading as an escape.
+- **Creations/deletions are snapshot-only.** An Edit on a file EGHS never saw denies `UNREAD_OR_STALE`,
+  not `RACE_DETECTED`, so §5's rate is undefined over them.
+- **The watcher writes only into `debug/`** (`bypass-watcher.jsonl` + `.bypass-snapshot.json`) — an
+  existing §R2.5 subdir, so no layout change and no `schema_version` bump. `debug/` GC is per-sid and
+  never touches those two, so the watcher rotates its own log at 5 MiB (§G5).
+- **The watcher is not a hook**: no lease, no guard, no precedence chain. It honours the kill switch
+  before any write, requires a healthy schema + fs-info, and prunes `.git`, `node_modules`, and the
+  state dir from its walk.
+- `eghs-metrics` and `eghs-bypass-watcher` share `gate.js`'s picomatch call semantics (v4, `{dot:true}`,
+  repo-relative) — §R3's "picomatch 단일 reference" rule.
+
+## Deferred: Codex CLI Port (comes AFTER P5)
 
 User decision 2026-07-02: make EGHS usable from OpenAI Codex CLI, but only once every
-Claude Code phase is done. Research is complete and preserved in
+Claude Code phase is done. **P5 closed 2026-08-17, so this is now the next thing on deck.**
+Research is complete and preserved in
 `docs/research/2026-07-02-codex-hooks-research.md` — Codex ships a Claude Code-compatible
 hooks.json subsystem (same events/exit-2-stderr contract), so the port is mostly
 registration (`.codex/hooks.json`, trust-gated) plus small payload/env deltas. Re-verify
@@ -89,10 +131,23 @@ node hooks/migrate.js --clear-init-lock
 
 Lock order for every admin op: `admin-mutex → migrate.lock → sid guard`.
 
+## Measurement CLIs (P5, read-only — no lock, no sid)
+
+```bash
+node hooks/metrics.js                       # PRD §5 metric table
+node hooks/metrics.js --json                # machine output
+node hooks/metrics.js --sid <SID> --since 7d
+node hooks/bypass-watcher.js --once         # one poll (first poll = baseline only)
+node hooks/bypass-watcher.js --interval-seconds 30
+```
+
+`bypass_detection_rate` stays `n/a` until the watcher has produced observations AND a later
+Write/Edit touched the same path — run the watcher before/after a shell edit to exercise it.
+
 ## Verification Quick Reference
 
 ```bash
-npm test                                   # full suite, expect 427 passing
+npm test                                   # full suite, expect 467 passing
 printf '{"session_id":"11111111-1111-4111-8111-111111111111"}' \
   | node hooks/stop.js; echo " exit=$?"    # Stop smoke (this repo: exit 0, EMPTY stdout when clean)
 printf '{}' | node hooks/user-prompt-submit.js; echo " exit=$?"  # UPS smoke: principles JSON + exit 0

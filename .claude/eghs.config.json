@@ -1,3 +1,8 @@
 {
-  "state_gate_paths": ["hooks/**/*.js"]
+  "state_gate_paths": [
+    "hooks/**/*.js",
+    "tests/**/*.js",
+    "package.json",
+    ".claude/*.json"
+  ]
 }
