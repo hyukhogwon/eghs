@@ -15,7 +15,7 @@ Evidence-Gated Hook System for Claude Code. Rollout per PRD §6 — **all five p
 | P5 | matcher expansion to source/config + measurement CLIs | **DONE** (units 1-4, +42 tests) |
 
 - Branch: `main`, pushed to https://github.com/hyukhogwon/eghs (public). Everything after P2 is local-only until the user asks for a push.
-- Suite: **469/469** via `npm test`. Do NOT use `node --test tests/` (bare directory form) — broken on Node v24; single-file `node --test tests/<file>.js` works.
+- Suite: **490/490** via `npm test`. Do NOT use `node --test tests/` (bare directory form) — broken on Node v24; single-file `node --test tests/<file>.js` works.
 - **The R3 gate is LIVE in this repo, now over source AND config**: `.claude/eghs.config.json` sets
   `state_gate_paths: ["hooks/**/*.js", "tests/**/*.js", "package.json", ".claude/*.json"]`, so editing any of
   those without a same-session `full_read`/`post_edit_success` record is denied (exit 2). Read the file
@@ -117,9 +117,30 @@ against the then-installed Codex version before designing.
 - The R3 gate reads exactly what `node hooks/inspect.js --dry-run` prints (state record, key marker, sid marker, pre-files) — inspect is the gate's preview.
 - NFC/NFD normalization DECIDED at P3 finale (2026-07-03): canonical key on caseless FS is `lowercase(NFC(realpath))` — PRD §R2 amended, implemented in `hooks/lib/canonical.js` (`caselessKey`).
 
+## Installing into a consumer repo (`install.sh`)
+
+`./install.sh <target-project>` (or run it with no arg from inside the target) is the only
+supported install path — there is no npm package: `package.json` has no `bin`/`files` and hook
+registration is `$CLAUDE_PROJECT_DIR/hooks/*.js`, so EGHS must live **inside** the repo it guards.
+
+Design points, all covered by `tests/install.test.js` (17 tests, real installs into temp repos):
+
+- **Deps go to `<target>/hooks/node_modules`** via `npm install --prefix`, so the consumer's own
+  `package.json` is never touched and a non-Node project can still install.
+- **`settings.json` is merged, never clobbered**: our four commands are stripped by regex and
+  re-added (idempotent + upgrades cleanly), every foreign hook and unrelated key is preserved, the
+  file is backed up first, and a corrupt existing file aborts the install rather than replacing it.
+- **Re-running calls `init.js --repair`, not `init.js`** — plain init refuses when `schema_version`
+  exists (bootstrap vs upgrade are different roles per §R2.5). Caught by the idempotency test.
+- Ships with the gate OFF (`state_gate_paths: []`); an existing `eghs.config.json` is left alone.
+- Ends with a real smoke: a `--dry-run` decision through the installed hooks, then `inspect.js`.
+  Its scratch file lives under the state dir and is removed.
+- Refuses to target the EGHS checkout itself.
+
 ## Admin CLIs
 
 ```bash
+./install.sh <target>                   # install/upgrade EGHS in another repo
 node hooks/init.js                      # bootstrap (schema_version written LAST)
 node hooks/init.js --repair             # Cases 1-5: INVALID schema, missing subdir, fs-info absent/unhealthy, no-op
 node hooks/migrate.js                   # schema move: sessions GC -> empty-state precondition -> record wipe -> atomic bump
@@ -154,7 +175,7 @@ evidence on newly-gated `tests/` files, and n is tiny. Recheck once the sample g
 ## Verification Quick Reference
 
 ```bash
-npm test                                   # full suite, expect 469 passing
+npm test                                   # full suite, expect 490 passing
 printf '{"session_id":"11111111-1111-4111-8111-111111111111"}' \
   | node hooks/stop.js; echo " exit=$?"    # Stop smoke (this repo: exit 0, EMPTY stdout when clean)
 printf '{}' | node hooks/user-prompt-submit.js; echo " exit=$?"  # UPS smoke: principles JSON + exit 0

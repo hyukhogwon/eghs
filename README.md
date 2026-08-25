@@ -18,12 +18,32 @@ Evidence-Gated Hook System for Claude Code. See `PRD.md` for the full spec.
 
 ## Setup
 
+내 프로젝트에 설치하려면 이 리포를 클론하고 `install.sh`를 대상 프로젝트에 대고 실행한다:
+
 ```bash
-npm install
-node hooks/init.js
+git clone https://github.com/hyukhogwon/eghs && cd eghs
+./install.sh ~/code/my-project
 ```
 
-`.claude/eghs.config.json`에서 설정한다:
+보호할 프로젝트 안에서 인자 없이 실행해도 된다:
+
+```bash
+cd ~/code/my-project && ~/src/eghs/install.sh
+```
+
+설치 스크립트가 하는 일 — hook 코드 복사, 의존성(`fs-ext`는 네이티브 컴파일) 설치,
+`.claude/settings.json`에 hook 4개 등록, `eghs.config.json` 생성, `.gitignore` 갱신,
+state 부트스트랩, 그리고 **hook이 실제로 실행돼 판정을 내는지 스모크 검증**까지.
+
+- 의존성은 `<project>/hooks/node_modules`에 들어간다 — **프로젝트 루트의 `package.json`은
+  건드리지 않는다**. Node 프로젝트가 아니어도 설치된다.
+- `settings.json`은 병합한다. 기존 hook과 다른 설정 키는 보존하고, 덮어쓰기 전에 백업을
+  남긴다. 기존 파일이 깨진 JSON이면 설치를 중단한다(파괴 금지).
+- 재실행하면 hook 코드만 교체하는 **업그레이드**가 된다. 등록이 중복되지 않고,
+  이미 만들어둔 `eghs.config.json`은 유지된다.
+
+**설치 직후 게이트는 꺼져 있다.** hook은 증거만 기록하고 아무것도 막지 않는다.
+켜려면 `.claude/eghs.config.json`에 글롭을 적는다:
 
 ```json
 {
@@ -37,9 +57,14 @@ node hooks/init.js
   (picomatch v4, `{dot:true}`) 문법이며 repo 루트 기준 상대 경로에 매칭한다. 중첩 경로는
   `**/`가 필요하고, gitignore 문법이 아니다.
 
-All hooks (Stop, UserPromptSubmit, PreToolUse/PostToolUse for Read/Write/Edit/MultiEdit)
-are registered in `.claude/settings.json`. Make sure `.claude/state/` is
-gitignored (state includes session leases, locks, evidence records, and verification logs, not source).
+### 수동 설치
+
+`install.sh` 없이 하려면: `hooks/`를 복사하고 `npm install --prefix <project>/hooks
+fs-ext@^2.1.1 picomatch@^4.0.4`, `.claude/settings.json`에 Stop / UserPromptSubmit /
+PreToolUse·PostToolUse(matcher `Read|Write|Edit|MultiEdit`) 4개를
+`node "$CLAUDE_PROJECT_DIR/hooks/<entrypoint>.js"`로 등록, `.claude/state/`를 gitignore에
+추가한 뒤 `node hooks/init.js`. (state에는 세션 lease·lock·증거 기록·검증 로그가 들어간다.
+소스가 아니므로 커밋하지 않는다.)
 
 ## 게이트 동작
 

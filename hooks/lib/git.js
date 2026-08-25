@@ -9,6 +9,14 @@ function git(args, cwd) {
   return execFileSync('git', ['-c', 'core.quotePath=false', ...args], {
     cwd,
     encoding: 'utf8',
+    // execFileSync inherits the child's stderr by default, so git's own
+    // "fatal: not a git repository" / "ambiguous argument 'HEAD'" text reached
+    // the hook's stderr even on the paths that catch and handle those cases.
+    // On a deny that matters: exit 2 makes stderr the ONLY channel Claude Code
+    // relays to the model (PRD §MVP item 7), so unrelated git chatter would be
+    // read as part of the block reason. Callers use err.message, which the
+    // pipe preserves.
+    stdio: ['ignore', 'pipe', 'pipe'],
   }).trim();
 }
 
