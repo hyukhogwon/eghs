@@ -67,7 +67,7 @@ step "Checking prerequisites"
 command -v node >/dev/null 2>&1 || die "node not found — EGHS hooks are Node scripts"
 command -v npm  >/dev/null 2>&1 || die "npm not found — needed to install fs-ext/picomatch"
 
-NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
+NODE_MAJOR="$(node -e 'process.stdout.write(process.versions.node.split(".")[0])')"
 [ "$NODE_MAJOR" -ge 18 ] || die "node >= 18 required (found $(node -v))"
 ok "node $(node -v), npm $(npm -v)"
 
@@ -91,6 +91,25 @@ rm -rf "$TARGET/hooks/lib"
 cp -R "$SRC/hooks/lib" "$TARGET/hooks/lib"
 cp "$SRC"/hooks/*.js "$TARGET/hooks/"
 ok "$(ls "$SRC"/hooks/*.js | wc -l | tr -d ' ') entrypoints + lib/"
+
+# Stamp what was installed so update.sh can tell old from new, and so a
+# consumer repo can answer "which EGHS is this?" without guessing.
+SRC_COMMIT="$(git -C "$SRC" rev-parse HEAD 2>/dev/null || echo 'unknown')"
+# node -e + stdout.write, never `node -p`: -p renders non-strings through
+# util.inspect, which colourises when FORCE_COLOR is set even into a pipe —
+# that turned the version into "\e[33m1\e[39m" and stamped schema_version null.
+SRC_SCHEMA="$(node -e "process.stdout.write(String(require('$SRC/hooks/lib/schema.js').HOOK_SCHEMA_VERSION))")"
+SRC_COMMIT="$SRC_COMMIT" SRC_SCHEMA="$SRC_SCHEMA" SRC_PATH="$SRC" \
+  STAMP="$TARGET/hooks/.eghs-version" node -e '
+const fs = require("fs");
+fs.writeFileSync(process.env.STAMP, JSON.stringify({
+  commit: process.env.SRC_COMMIT,
+  schema_version: Number(process.env.SRC_SCHEMA),
+  installed_at: new Date().toISOString(),
+  source: process.env.SRC_PATH,
+}, null, 2) + "\n");
+'
+note "stamped hooks/.eghs-version ($(printf '%.12s' "$SRC_COMMIT"), schema v$SRC_SCHEMA)"
 
 # --- dependencies -----------------------------------------------------------
 

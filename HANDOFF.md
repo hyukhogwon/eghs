@@ -15,7 +15,7 @@ Evidence-Gated Hook System for Claude Code. Rollout per PRD §6 — **all five p
 | P5 | matcher expansion to source/config + measurement CLIs | **DONE** (units 1-4, +42 tests) |
 
 - Branch: `main`, pushed to https://github.com/hyukhogwon/eghs (public). Everything after P2 is local-only until the user asks for a push.
-- Suite: **490/490** via `npm test`. Do NOT use `node --test tests/` (bare directory form) — broken on Node v24; single-file `node --test tests/<file>.js` works.
+- Suite: **506/506** via `npm test`. Do NOT use `node --test tests/` (bare directory form) — broken on Node v24; single-file `node --test tests/<file>.js` works.
 - **The R3 gate is LIVE in this repo, now over source AND config**: `.claude/eghs.config.json` sets
   `state_gate_paths: ["hooks/**/*.js", "tests/**/*.js", "package.json", ".claude/*.json"]`, so editing any of
   those without a same-session `full_read`/`post_edit_success` record is denied (exit 2). Read the file
@@ -136,11 +136,34 @@ Design points, all covered by `tests/install.test.js` (17 tests, real installs i
 - Ends with a real smoke: a `--dry-run` decision through the installed hooks, then `inspect.js`.
   Its scratch file lives under the state dir and is removed.
 - Refuses to target the EGHS checkout itself.
+- Stamps `<target>/hooks/.eghs-version` (commit + schema version + timestamp). `update.sh` diffs
+  against it; without it an update still works but reports no delta.
+
+## Updating a consumer repo (`update.sh`)
+
+`./update.sh <target> [--check|--no-pull|--force]`. install.sh already upgrades in place, so
+update.sh exists for the three things it cannot do — and **delegates the actual copy to
+install.sh** rather than keeping a second implementation:
+
+1. `git pull --ff-only` into the checkout first.
+2. Report the commit delta (`installed stamp..HEAD`) and no-op when already current.
+3. Detect a `HOOK_SCHEMA_VERSION` bump against the target's `state/eghs/schema_version` and print
+   the `eghs-migrate` instruction.
+
+Pull is SKIPPED (not fatal) when: `--no-pull`, the source is not a git checkout, the checkout is
+dirty, or **the branch has no upstream** — that last case was a real abort-on-normal-state bug the
+tests caught. A pull that was genuinely possible and then failed still aborts.
+
+`tests/update.test.js` (16 tests) drives real checkouts and real installs. The one that matters
+most asserts the schema-bump message is TRUE end to end: bump → update → a gated Edit denies
+`SCHEMA_MISMATCH` → `migrate.js` refuses while a lease exists → `--clear-sid` → migrate → the same
+Edit is back to ordinary `UNREAD_OR_STALE` gating.
 
 ## Admin CLIs
 
 ```bash
 ./install.sh <target>                   # install/upgrade EGHS in another repo
+./update.sh <target> [--check]          # pull upstream, show the delta, apply, flag schema bumps
 node hooks/init.js                      # bootstrap (schema_version written LAST)
 node hooks/init.js --repair             # Cases 1-5: INVALID schema, missing subdir, fs-info absent/unhealthy, no-op
 node hooks/migrate.js                   # schema move: sessions GC -> empty-state precondition -> record wipe -> atomic bump
@@ -175,7 +198,7 @@ evidence on newly-gated `tests/` files, and n is tiny. Recheck once the sample g
 ## Verification Quick Reference
 
 ```bash
-npm test                                   # full suite, expect 490 passing
+npm test                                   # full suite, expect 506 passing
 printf '{"session_id":"11111111-1111-4111-8111-111111111111"}' \
   | node hooks/stop.js; echo " exit=$?"    # Stop smoke (this repo: exit 0, EMPTY stdout when clean)
 printf '{}' | node hooks/user-prompt-submit.js; echo " exit=$?"  # UPS smoke: principles JSON + exit 0

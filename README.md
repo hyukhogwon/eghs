@@ -41,6 +41,34 @@ state 부트스트랩, 그리고 **hook이 실제로 실행돼 판정을 내는�
   남긴다. 기존 파일이 깨진 JSON이면 설치를 중단한다(파괴 금지).
 - 재실행하면 hook 코드만 교체하는 **업그레이드**가 된다. 등록이 중복되지 않고,
   이미 만들어둔 `eghs.config.json`은 유지된다.
+- 설치된 버전은 `<project>/hooks/.eghs-version`에 기록된다(커밋 + schema 버전 + 시각).
+
+## 업데이트
+
+EGHS 최신 버전을 이미 설치된 프로젝트에 반영한다:
+
+```bash
+cd ~/src/eghs
+./update.sh ~/code/my-project --check   # 뭐가 바뀌는지만 보고, 아무것도 안 씀
+./update.sh ~/code/my-project           # 적용
+```
+
+`install.sh`도 재실행하면 업그레이드가 되지만, `update.sh`는 그것만으로 안 되는 세 가지를
+한다:
+
+1. **업스트림을 먼저 당긴다** (`git pull --ff-only`). 체크아웃이 더럽거나 추적 브랜치가
+   없으면 당기지 않고 현재 상태로 진행한다(경고만) — 로컬 작업을 덮지 않는다.
+2. **델타를 보여준다.** 설치된 커밋과 새 커밋 사이의 커밋 목록. 이미 최신이면
+   아무것도 하지 않는다(`--force`로 강제 재설치).
+3. **schema bump를 감지한다.** hook의 `HOOK_SCHEMA_VERSION`이 올라갔는데 state dir이
+   구버전이면, 업데이트 직후부터 모든 게이트 편집이 `SCHEMA_MISMATCH`로 거부된다.
+   이 경우 `node hooks/migrate.js`를 실행하라고 안내한다. migrate는 **세션 lease가 하나도
+   없어야** 동작하므로, 해당 프로젝트의 Claude Code 세션을 먼저 닫아야 한다.
+
+옵션 — `--check`(보고만), `--no-pull`(pull 생략), `--force`(최신이어도 재설치).
+
+EGHS가 아직 설치되지 않은 프로젝트에 `update.sh`를 돌리면 `install.sh`를 쓰라고 알려주고
+중단한다.
 
 **설치 직후 게이트는 꺼져 있다.** hook은 증거만 기록하고 아무것도 막지 않는다.
 켜려면 `.claude/eghs.config.json`에 글롭을 적는다:
