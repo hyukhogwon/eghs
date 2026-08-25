@@ -39,11 +39,18 @@ function writeConfig(repo, config) {
 // stop (any JSON with decision:"allow" fails Claude Code's output schema);
 // exit 2 blocks, with the reason on STDERR (stdout is not parsed on exit 2).
 function runStop(repo, input, extraEnv = {}) {
+  // STOP_HOOK_ACTIVE must NOT be inherited. When this suite is itself a
+  // verification_commands entry, the real Stop hook forces STOP_HOOK_ACTIVE=1
+  // on its children (verify.js, PRD §R5) — that would reach every stop.js
+  // spawned here, trip the recursion guard, and fail 14 of these tests for a
+  // reason that has nothing to do with what they assert. The one test that
+  // exercises the guard passes it explicitly through extraEnv.
+  const { STOP_HOOK_ACTIVE, ...cleanEnv } = process.env;
   const r = spawnSync('node', [STOP_SCRIPT], {
     cwd: repo,
     input: JSON.stringify(input),
     encoding: 'utf8',
-    env: { ...process.env, ...extraEnv },
+    env: { ...cleanEnv, ...extraEnv },
   });
   return { exitCode: r.status, stdout: r.stdout, stderr: r.stderr };
 }
@@ -134,8 +141,9 @@ test('malformed stdin JSON is reported as INPUT_PARSE, not a crash', () => {
   const repo = mkRepo();
   execFileSync('node', [INIT_SCRIPT], { cwd: repo });
   let result;
+  const { STOP_HOOK_ACTIVE, ...cleanEnv } = process.env; // see runStop
   try {
-    execFileSync('node', [STOP_SCRIPT], { cwd: repo, input: '{ not json', encoding: 'utf8' });
+    execFileSync('node', [STOP_SCRIPT], { cwd: repo, input: '{ not json', encoding: 'utf8', env: cleanEnv });
     result = { threw: false };
   } catch (err) {
     result = { threw: true, status: err.status, stderr: err.stderr };

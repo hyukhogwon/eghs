@@ -221,3 +221,27 @@ Use a throwaway sid for manual end-to-end smokes and clean it up afterwards with
 `node hooks/migrate.js --clear-sid <SID> --force`.
 
 Kill switch for local debugging: `touch .claude/eghs-off` (remove after) or `EGHS_DISABLED=1`.
+
+## P1 is now actually ON in this repo (2026-08-25)
+
+Until today `.claude/eghs.config.json` had no `verification_commands`, so this repo's own Stop
+hook verified **nothing** — the project that exists to enforce Stop-time verification was not
+running it, and `eghs-metrics`' `stop_verification_pass_rate` was measuring the pass rate of a
+no-op (the 81.8% reported on 2026-08-17 is meaningless; discard it). External review caught it.
+
+Now: `verification_commands: {test: "npm test"}` (~23s) with
+`skip_if_only_changed: ["**/*.md", ".superpowers/**"]` so docs-only turns cost 0.13s.
+
+**Turning it on immediately exposed a real bug**: the suite could not be its own verification
+command. `verify.js` forces `STOP_HOOK_ACTIVE=1` on verification children (PRD §R5 recursion
+guard); `tests/stop.test.js` and `tests/dry-run.test.js` spawned hooks with `{...process.env}`,
+so the guard reached every child stop.js and short-circuited it — 15 failures, none related to
+what those tests assert. Both spawn helpers now strip `STOP_HOOK_ACTIVE` from the inherited env
+(the one test that exercises the guard passes it explicitly via `extraEnv`).
+
+Regression check for anyone touching those helpers — BOTH must be green:
+
+```bash
+npm test                      # 506/506
+STOP_HOOK_ACTIVE=1 npm test   # 506/506  <- the repo eating its own dog food
+```

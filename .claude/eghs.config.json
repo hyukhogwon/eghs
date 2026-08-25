@@ -4,5 +4,12 @@
     "tests/**/*.js",
     "package.json",
     ".claude/*.json"
+  ],
+  "verification_commands": {
+    "test": "npm test"
+  },
+  "skip_if_only_changed": [
+    "**/*.md",
+    ".superpowers/**"
   ]
 }

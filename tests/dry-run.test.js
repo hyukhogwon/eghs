@@ -38,11 +38,15 @@ function snapshot(dir) {
 }
 
 function dryRun(repo, hook, input, extraEnv = {}) {
+  // Not inherited: when this suite runs AS a verification_commands entry, the
+  // real Stop hook forces STOP_HOOK_ACTIVE=1 on its children, which would turn
+  // the stop dry-run's expected 'allow' into the recursion guard's 'skip'.
+  const { STOP_HOOK_ACTIVE, ...cleanEnv } = process.env;
   const r = spawnSync('node', [path.join(HOOKS, hook), '--dry-run'], {
     cwd: repo,
     input: typeof input === 'string' ? input : JSON.stringify(input),
     encoding: 'utf8',
-    env: { ...process.env, ...extraEnv },
+    env: { ...cleanEnv, ...extraEnv },
   });
   const lines = r.stdout.trim().split('\n').filter(Boolean);
   return {
